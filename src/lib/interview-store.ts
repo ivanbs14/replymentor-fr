@@ -11,6 +11,7 @@ export type ResponseCard = {
 };
 
 type InterviewState = {
+  authUser: { id: string; email: string } | null;
   contextForm: {
     resumeText: string;
     interviewType: string;
@@ -28,9 +29,11 @@ type InterviewState = {
   latestResponse: ResponseCard | null;
   history: ResponseCard[];
   summary: string | null;
+  setAuthUser: (authUser: InterviewState['authUser']) => void;
+  resetInterviewState: () => void;
   setContextField: (key: string, value: string) => void;
   setContextForm: (form: InterviewState['contextForm']) => void;
-  setContextId: (contextId: string) => void;
+  setContextId: (contextId: string | null) => void;
   setSessionId: (sessionId: string | null) => void;
   setSessionStatus: (status: InterviewState['sessionStatus']) => void;
   setTranscriptInput: (value: string) => void;
@@ -40,6 +43,7 @@ type InterviewState = {
 };
 
 export const useInterviewStore = create<InterviewState>((set) => ({
+  authUser: null,
   contextForm: {
     resumeText: '',
     interviewType: 'Técnica',
@@ -57,6 +61,27 @@ export const useInterviewStore = create<InterviewState>((set) => ({
   latestResponse: null,
   history: [],
   summary: null,
+  setAuthUser: (authUser) => set({ authUser }),
+  resetInterviewState: () =>
+    set({
+      contextForm: {
+        resumeText: '',
+        interviewType: 'Técnica',
+        jobLevel: 'Pleno',
+        jobDescription: '',
+        companyName: '',
+        companySegment: '',
+        responsePreference: 'equilibrada',
+        aiBehavior: '',
+      },
+      contextId: null,
+      sessionId: null,
+      sessionStatus: 'idle',
+      transcriptInput: '',
+      latestResponse: null,
+      history: [],
+      summary: null,
+    }),
   setContextField: (key, value) =>
     set((state) => ({
       contextForm: { ...state.contextForm, [key]: value },

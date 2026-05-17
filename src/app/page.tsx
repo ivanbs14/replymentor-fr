@@ -1,12 +1,14 @@
 'use client';
 
 import { useMutation } from '@tanstack/react-query';
+import Link from 'next/link';
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
-import { api } from '@/lib/api';
+import { api, setApiToken, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 
 type LlmProvider = 'gemini' | 'ollama' | 'openai';
+const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
@@ -35,7 +37,7 @@ async function fileToBase64(file: File): Promise<string> {
 
 export default function Home() {
   const {
-    contextForm,
+    authUser,
     contextId,
     sessionId,
     sessionStatus,
@@ -43,8 +45,8 @@ export default function Home() {
     latestResponse,
     history,
     summary,
-    setContextField,
-    setContextForm,
+    setAuthUser,
+    resetInterviewState,
     setContextId,
     setSessionId,
     setSessionStatus,
@@ -53,7 +55,6 @@ export default function Home() {
     selectResponse,
     setSummary,
   } = useInterviewStore();
-  const attemptedHydration = useRef(false);
   const audioInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -64,45 +65,91 @@ export default function Home() {
   const [recordingError, setRecordingError] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [selectedModel, setSelectedModel] = useState('');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
 
   useEffect(() => {
-    if (contextId || attemptedHydration.current) return;
-    attemptedHydration.current = true;
+    const handleUnauthorized = () => {
+      localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setApiToken(null);
+      setAuthUser(null);
+      resetInterviewState();
+    };
+
+    setUnauthorizedHandler(handleUnauthorized);
+
+    const token = localStorage.getItem('replymentor_token');
+    if (!token) {
+      setAuthUser(null);
+      setApiToken(null);
+      return () => {
+        setUnauthorizedHandler(null);
+      };
+    }
+
+    setApiToken(token);
 
     api
-      .getLatestContext()
-      .then((context) => {
-        setContextId(context.id);
-        setContextForm({
-          resumeText: context.resumeText,
-          interviewType: context.interviewType,
-          jobLevel: context.jobLevel,
-          jobDescription: context.jobDescription,
-          companyName: context.companyName,
-          companySegment: context.companySegment ?? '',
-          responsePreference: context.responsePreference,
-          aiBehavior: context.aiBehavior ?? '',
-        });
+      .me()
+      .then((user) => {
+        setAuthUser({ id: user.id, email: user.email });
       })
       .catch(() => {
-        // Se não houver contexto no banco, mantém fluxo de criação manual.
+        localStorage.removeItem('replymentor_token');
+        setApiToken(null);
+        setAuthUser(null);
+        resetInterviewState();
       });
-  }, [contextId, setContextForm, setContextId]);
 
-  const createContextMutation = useMutation({
+    return () => {
+      setUnauthorizedHandler(null);
+    };
+  }, [resetInterviewState, setAuthUser]);
+
+  useEffect(() => {
+    if (!authUser) return;
+
+    const selectedContextId = localStorage.getItem(SELECTED_CONTEXT_STORAGE_KEY);
+    if (!selectedContextId) {
+      setContextId(null);
+      return;
+    }
+
+    if (selectedContextId === contextId) return;
+    setContextId(selectedContextId);
+  }, [authUser, contextId, setContextId]);
+
+  const loginMutation = useMutation({
     mutationFn: () =>
-      api.createContext({
-        resumeText: contextForm.resumeText,
-        interviewType: contextForm.interviewType,
-        jobLevel: contextForm.jobLevel,
-        jobDescription: contextForm.jobDescription,
-        companyName: contextForm.companyName,
-        companySegment: contextForm.companySegment,
-        responsePreference: contextForm.responsePreference,
-        aiBehavior: contextForm.aiBehavior.trim() || undefined,
+      api.login({
+        email: authEmail.trim().toLowerCase(),
+        password: authPassword,
       }),
     onSuccess: (data) => {
-      setContextId(data.id);
+      localStorage.setItem('replymentor_token', data.accessToken);
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setApiToken(data.accessToken);
+      setAuthUser(data.user);
+      setAuthPassword('');
+      resetInterviewState();
+    },
+  });
+
+  const registerMutation = useMutation({
+    mutationFn: () =>
+      api.register({
+        email: authEmail.trim().toLowerCase(),
+        password: authPassword,
+      }),
+    onSuccess: (data) => {
+      localStorage.setItem('replymentor_token', data.accessToken);
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setApiToken(data.accessToken);
+      setAuthUser(data.user);
+      setAuthPassword('');
+      resetInterviewState();
     },
   });
 
@@ -178,7 +225,8 @@ export default function Home() {
   });
 
   const mutationError =
-    createContextMutation.error ||
+    loginMutation.error ||
+    registerMutation.error ||
     startSessionMutation.error ||
     generateResponseMutation.error ||
     endSessionMutation.error;
@@ -194,14 +242,27 @@ export default function Home() {
     : mutationErrorMessage;
 
   const isLoading =
-    createContextMutation.isPending ||
+    loginMutation.isPending ||
+    registerMutation.isPending ||
     startSessionMutation.isPending ||
     generateResponseMutation.isPending ||
     endSessionMutation.isPending;
 
-  const handleSaveContext = (event: FormEvent) => {
+  const handleAuthSubmit = (event: FormEvent) => {
     event.preventDefault();
-    createContextMutation.mutate();
+    if (authMode === 'login') {
+      loginMutation.mutate();
+      return;
+    }
+    registerMutation.mutate();
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('replymentor_token');
+    localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+    setApiToken(null);
+    setAuthUser(null);
+    resetInterviewState();
   };
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
@@ -328,6 +389,69 @@ export default function Home() {
     openai: 'OpenAI',
   };
 
+  if (!authUser) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#f8f9ff] px-6 py-10">
+        <div className="w-full max-w-md rounded-2xl border border-[#c3c6d7] bg-white p-8 shadow-sm">
+          <h1 className="text-2xl font-bold text-[#004ac6]">ReplyMentor</h1>
+          <p className="mt-2 text-sm text-[#434655]">
+            Faça login para acessar seu workspace de entrevista.
+          </p>
+
+          <form className="mt-6 space-y-4" onSubmit={handleAuthSubmit}>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-[#0d1c2e]">E-mail</label>
+              <input
+                type="email"
+                required
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+                className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-[#0d1c2e]">Senha</label>
+              <input
+                type="password"
+                required
+                minLength={6}
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="h-11 w-full rounded-xl bg-[#004ac6] text-sm font-semibold text-white hover:opacity-95 disabled:opacity-60"
+            >
+              {authMode === 'login' ? 'Entrar' : 'Criar conta'}
+            </button>
+          </form>
+
+          <button
+            type="button"
+            onClick={() => setAuthMode((prev) => (prev === 'login' ? 'register' : 'login'))}
+            className="mt-4 text-sm font-medium text-[#004ac6] hover:underline"
+          >
+            {authMode === 'login'
+              ? 'Não tem conta? Criar agora'
+              : 'Já tem conta? Fazer login'}
+          </button>
+
+          {mutationError ? (
+            <Alert className="mt-4" variant="destructive">
+              <span className="material-symbols-outlined text-[18px]">error</span>
+              <AlertTitle>Erro de autenticação</AlertTitle>
+              <AlertDescription>{displayedErrorMessage}</AlertDescription>
+            </Alert>
+          ) : null}
+        </div>
+      </main>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#f8f9ff] text-[#0d1c2e]">
       {contextId ? (
@@ -351,10 +475,18 @@ export default function Home() {
               <span className="border-b-2 border-[#004ac6] pb-1 text-sm font-semibold text-[#004ac6]">
                 Dashboard
               </span>
-              <span className="text-sm text-[#434655]">Practice</span>
-              <span className="text-sm text-[#434655]">Resources</span>
+              <Link href="/contexts" className="text-sm text-[#434655] hover:text-[#004ac6]">
+                Contextos
+              </Link>
             </nav>
-            <div className="hidden items-center gap-2 md:flex">
+            <div className="flex items-center gap-2">
+              <span className="hidden text-sm text-[#434655] md:inline">{authUser.email}</span>
+              <Link
+                href="/contexts"
+                className="rounded-lg border border-[#c3c6d7] px-3 py-1 text-sm font-medium text-[#434655] hover:bg-[#eff4ff]"
+              >
+                Contextos
+              </Link>
               <button
                 type="button"
                 className="rounded-full p-2 text-[#434655] transition hover:bg-[#eff4ff]"
@@ -368,6 +500,13 @@ export default function Home() {
                 aria-label="Configurações"
               >
                 <span className="material-symbols-outlined">settings</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-lg border border-[#c3c6d7] px-3 py-1 text-sm font-medium text-[#434655] hover:bg-[#eff4ff]"
+              >
+                Sair
               </button>
             </div>
           </div>
@@ -388,209 +527,75 @@ export default function Home() {
               <span className="border-b-2 border-[#004ac6] pb-1 text-sm font-semibold text-[#004ac6]">
                 Dashboard
               </span>
+              <Link href="/contexts" className="text-sm text-[#434655] hover:text-[#004ac6]">
+                Contextos
+              </Link>
             </nav>
+            <div className="flex items-center gap-3">
+              <Link
+                href="/contexts"
+                className="rounded-lg border border-[#c3c6d7] px-3 py-1 text-sm font-medium text-[#434655] hover:bg-[#eff4ff]"
+              >
+                Contextos
+              </Link>
+              <span className="hidden text-sm text-[#434655] md:inline">{authUser.email}</span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-lg border border-[#c3c6d7] px-3 py-1 text-sm font-medium text-[#434655] hover:bg-[#eff4ff]"
+              >
+                Sair
+              </button>
+            </div>
           </div>
         </header>
       )}
 
       {!contextId ? (
-        <main className="mx-auto min-h-screen w-full max-w-[1280px] px-6 py-12">
-          <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-semibold leading-[40px] tracking-[-0.01em]">
-              Configure o contexto da sua entrevista
-            </h2>
-            <p className="mx-auto mt-2 max-w-2xl text-[18px] leading-7 text-[#434655]">
-              Quanto mais contexto você fornecer, mais precisas serão as sugestões de resposta
-              durante o seu processo seletivo.
-            </p>
-          </div>
-
-          <form
-            id="context-form"
-            onSubmit={handleSaveContext}
-            className="overflow-hidden rounded-2xl border border-[#c3c6d7] bg-white shadow-[0_4px_20px_rgba(0,0,0,0.04)]"
-          >
-            <section className="border-b border-[#c3c6d7] p-8">
-              <SectionHeader
-                icon="description"
-                title="Perfil profissional"
-                subtitle="Cole seu currículo ou resumo da sua carreira profissional."
-              />
-              <textarea
-                className="mt-4 w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] leading-6 outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-                rows={6}
-                required
-                value={contextForm.resumeText}
-                onChange={(event) => setContextField('resumeText', event.target.value)}
-                placeholder="Ex: Desenvolvedor Senior com 8 anos de experiência em React, Node.js e arquitetura de sistemas..."
-              />
-            </section>
-
-            <section className="border-b border-[#c3c6d7] bg-[#eff4ff]/30 p-8">
-              <SectionHeader
-                icon="work"
-                title="Entrevista"
-                subtitle="Detalhes sobre a oportunidade e o tipo de avaliação."
-              />
-              <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-2">
-                <SelectField
-                  label="Tipo de entrevista"
-                  value={contextForm.interviewType}
-                  onChange={(value) => setContextField('interviewType', value)}
-                  options={[
-                    'Técnica (Coding/System Design)',
-                    'Comportamental (Soft Skills)',
-                    'Conversa com RH',
-                    'Cultural Fit',
-                  ]}
-                />
-                <SelectField
-                  label="Nível da vaga"
-                  value={contextForm.jobLevel}
-                  onChange={(value) => setContextField('jobLevel', value)}
-                  options={['Júnior', 'Pleno', 'Sênior', 'Tech Lead']}
-                />
-                <div className="space-y-2 md:col-span-2">
-                  <label className="text-sm font-medium text-[#0d1c2e]">Descrição da vaga (JD)</label>
-                  <textarea
-                    className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-                    rows={4}
-                    required
-                    value={contextForm.jobDescription}
-                    onChange={(event) => setContextField('jobDescription', event.target.value)}
-                    placeholder="Cole aqui os requisitos e responsabilidades descritos na vaga..."
-                  />
-                </div>
+        <main className="mx-auto grid w-full max-w-[1280px] grid-cols-12 gap-6 px-6 py-6">
+          <aside className="col-span-12 space-y-3 md:col-span-3">
+            <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
+              <h2 className="text-[24px] font-semibold">Sessão em andamento</h2>
+              <div className="mt-4 flex flex-col gap-3">
+                <button
+                  type="button"
+                  disabled
+                  className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#004ac6] font-semibold text-white opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[20px]">play_circle</span>
+                  Iniciar escuta
+                </button>
               </div>
-            </section>
-
-            <section className="border-b border-[#c3c6d7] p-8">
-              <SectionHeader
-                icon="business"
-                title="Empresa"
-                subtitle="Informações sobre onde você está aplicando."
-              />
-              <div className="mt-6 grid grid-cols-1 gap-6">
-                <InputField
-                  label="Nome da empresa"
-                  value={contextForm.companyName}
-                  onChange={(value) => setContextField('companyName', value)}
-                  placeholder="Ex: Google, Stripe, Nubank..."
-                  required
-                />
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-[#0d1c2e]">Contexto da empresa</label>
-                  <textarea
-                    className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-                    rows={3}
-                    value={contextForm.companySegment}
-                    onChange={(event) => setContextField('companySegment', event.target.value)}
-                    placeholder="Cultura, produtos principais ou notícias recentes..."
-                  />
-                </div>
+              <div className="mt-4 rounded-xl bg-[#eff4ff] p-4">
+                <p className="text-sm text-[#434655]">
+                  Crie ou selecione um contexto para liberar a escuta da sessão.
+                </p>
               </div>
-            </section>
-
-            <section className="p-8">
-              <SectionHeader
-                icon="person"
-                title="Como a IA deve ser"
-                subtitle="Defina a persona/comportamento da IA para responder como se fosse você."
-              />
-              <div className="mt-4 space-y-2">
-                <label className="text-sm font-medium text-[#0d1c2e]">Instrução de comportamento</label>
-                <textarea
-                  className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-                  rows={3}
-                  value={contextForm.aiBehavior}
-                  onChange={(event) => setContextField('aiBehavior', event.target.value)}
-                  placeholder='Ex: "Quero que você aja como se fosse o entrevistado e responda em primeira pessoa com tom confiante e objetivo."'
-                />
+              <div className="mt-4 flex flex-col gap-2">
+                <Link
+                  href="/contexts/new"
+                  className="flex h-11 items-center justify-center rounded-xl bg-[#004ac6] text-sm font-semibold text-white hover:opacity-95"
+                >
+                  Criar novo contexto
+                </Link>
+                <Link
+                  href="/contexts"
+                  className="flex h-11 items-center justify-center rounded-xl border border-[#c3c6d7] bg-white text-sm font-semibold text-[#434655] hover:bg-[#eff4ff]"
+                >
+                  Selecionar contexto existente
+                </Link>
               </div>
-            </section>
-
-            <section className="border-t border-[#c3c6d7] p-8">
-              <SectionHeader
-                icon="tune"
-                title="Estilo de resposta"
-                subtitle="Como você prefere que o Copilot sugira suas falas."
-              />
-              <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
-                {[
-                  {
-                    key: 'direta e curta',
-                    title: 'Direta e curta',
-                    desc: 'Ideal para entrevistas técnicas rápidas.',
-                  },
-                  {
-                    key: 'equilibrada',
-                    title: 'Equilibrada',
-                    desc: 'Tom profissional com contexto suficiente.',
-                  },
-                  {
-                    key: 'mais detalhada',
-                    title: 'Mais detalhada',
-                    desc: 'Explicações profundas e estruturadas.',
-                  },
-                ].map((item) => {
-                  const active = contextForm.responsePreference.toLowerCase() === item.key;
-                  return (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() => setContextField('responsePreference', item.key)}
-                      className={`relative rounded-xl border-2 p-4 text-left transition ${
-                        active
-                          ? 'border-[#004ac6] bg-[#2563eb]/5'
-                          : 'border-[#c3c6d7] bg-white hover:border-[#004ac6]'
-                      }`}
-                    >
-                      <span
-                        className={`absolute right-4 top-4 flex h-5 w-5 items-center justify-center rounded-full border transition ${
-                          active ? 'border-[#004ac6] bg-white' : 'border-[#c3c6d7] bg-white'
-                        }`}
-                        aria-hidden="true"
-                      >
-                        <span
-                          className={`h-2.5 w-2.5 rounded-full transition ${
-                            active ? 'bg-[#004ac6]' : 'bg-transparent'
-                          }`}
-                        />
-                      </span>
-                      <p className="text-sm font-bold text-[#0d1c2e]">{item.title}</p>
-                      <p className="mt-1 text-sm text-[#434655]">{item.desc}</p>
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-
-          </form>
-
-          <div className="mt-8 flex flex-col items-center justify-end gap-4 md:flex-row">
-            <button
-              type="button"
-              className="w-full rounded-xl border border-[#c3c6d7] px-8 py-3 text-sm text-[#434655] hover:bg-[#dce9ff] md:w-auto"
-            >
-              Preencher depois
-            </button>
-            <button
-              type="submit"
-              form="context-form"
-              disabled={createContextMutation.isPending}
-              className="w-full rounded-xl bg-[#004ac6] px-10 py-4 text-[18px] font-semibold text-white shadow-lg shadow-[#004ac6]/20 hover:opacity-95 disabled:opacity-60 md:w-auto"
-            >
-              Salvar contexto da entrevista
-            </button>
-          </div>
-
-          {mutationError ? (
-            <Alert className="mt-6" variant="destructive">
-              <span className="material-symbols-outlined text-[18px]">error</span>
-              <AlertTitle>Erro ao processar solicitação</AlertTitle>
-              <AlertDescription>{displayedErrorMessage}</AlertDescription>
-            </Alert>
-          ) : null}
+            </div>
+          </aside>
+          <section className="col-span-12 md:col-span-9">
+            <div className="rounded-2xl border border-[#c3c6d7] bg-white p-8">
+              <h2 className="text-[24px] font-semibold">Dashboard</h2>
+              <p className="mt-2 text-sm text-[#434655]">
+                Você está no dashboard. Para começar uma sessão, primeiro crie ou selecione um
+                contexto.
+              </p>
+            </div>
+          </section>
         </main>
       ) : (
         <main className="mx-auto grid w-full max-w-[1280px] grid-cols-12 gap-6 px-6 py-6">
@@ -849,84 +854,6 @@ export default function Home() {
           ) : null}
         </main>
       )}
-    </div>
-  );
-}
-
-function SectionHeader({
-  icon,
-  title,
-  subtitle,
-}: {
-  icon: string;
-  title: string;
-  subtitle: string;
-}) {
-  return (
-    <div className="flex items-start gap-4">
-      <div className="rounded-xl bg-[#2563eb]/10 p-3">
-        <span className="material-symbols-outlined text-[#004ac6]">{icon}</span>
-      </div>
-      <div>
-        <h3 className="text-[24px] font-semibold leading-8 text-[#0d1c2e]">{title}</h3>
-        <p className="text-[16px] leading-6 text-[#434655]">{subtitle}</p>
-      </div>
-    </div>
-  );
-}
-
-function InputField({
-  label,
-  value,
-  onChange,
-  placeholder,
-  required,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-  required?: boolean;
-}) {
-  return (
-    <div className="space-y-2">
-      <label className="text-sm font-medium text-[#0d1c2e]">{label}</label>
-      <input
-        required={required}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        className="h-12 w-full rounded-xl border border-[#c3c6d7] bg-white px-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-      />
-    </div>
-  );
-}
-
-function SelectField({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  options: string[];
-}) {
-  return (
-    <div className="space-y-2">
-      <label className="text-sm font-medium text-[#0d1c2e]">{label}</label>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="h-12 w-full rounded-xl border border-[#c3c6d7] bg-white px-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
-      >
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </select>
     </div>
   );
 }

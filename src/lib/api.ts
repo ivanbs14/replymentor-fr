@@ -1,6 +1,17 @@
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001';
 
+let authToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setApiToken(token: string | null) {
+  authToken = token;
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
+
 type AddTranscriptPayload = {
   transcript?: string;
   audioBase64?: string;
@@ -17,9 +28,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       'Content-Type': 'application/json',
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
+
+  if (response.status === 401 && unauthorizedHandler) {
+    unauthorizedHandler();
+  }
 
   if (!response.ok) {
     const raw = await response.text();
@@ -44,6 +60,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  register: (body: { email: string; password: string }) =>
+    request<{
+      accessToken: string;
+      user: { id: string; email: string };
+    }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  login: (body: { email: string; password: string }) =>
+    request<{
+      accessToken: string;
+      user: { id: string; email: string };
+    }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  me: () =>
+    request<{
+      id: string;
+      email: string;
+      createdAt: string;
+      updatedAt: string;
+    }>('/auth/me'),
   getLatestContext: () =>
     request<{
       id: string;
@@ -56,6 +95,25 @@ export const api = {
       responsePreference: string;
       aiBehavior: string | null;
     }>('/interview/context/latest'),
+  getContexts: () =>
+    request<
+      Array<{
+        id: string;
+        resumeText: string;
+        interviewType: string;
+        jobLevel: string;
+        jobDescription: string;
+        companyName: string;
+        companySegment: string | null;
+        responsePreference: string;
+        aiBehavior: string | null;
+        createdAt: string;
+        updatedAt: string;
+        sessionsCount: number;
+        latestSessionAt: string | null;
+        latestSessionStatus: 'ACTIVE' | 'CLOSED' | null;
+      }>
+    >('/interview/contexts'),
   createContext: (body: Record<string, unknown>) =>
     request<{ id: string }>('/interview/context', {
       method: 'POST',
