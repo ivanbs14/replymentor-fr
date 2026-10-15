@@ -1,6 +1,6 @@
 # ReplyMentor Web
 
-Frontend do ReplyMentor: copiloto de entrevistas que escuta a conversa, identifica perguntas e sugere respostas estrategicas em tempo real.
+Frontend do ReplyMentor: Plataforma de assistência inteligente que utiliza IA generativa (LLMs), processamento de áudio e integração com APIs para analisar conversas, gerar respostas contextualizadas e apoiar interações profissionais.
 
 ## Contexto do Projeto
 
