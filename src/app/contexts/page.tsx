@@ -37,7 +37,7 @@ function compactText(text: string, max = 150) {
 }
 
 export default function ContextsPage() {
-  const { setContextId } = useInterviewStore();
+  const { resetInterviewState, setContextId } = useInterviewStore();
   const [authUser, setAuthUser] = useState<{ id: string; email: string } | null>(
     null,
   );
@@ -50,8 +50,10 @@ export default function ContextsPage() {
 
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       if (active) {
         setAuthUser(null);
+        resetInterviewState();
       }
     };
 
@@ -81,14 +83,19 @@ export default function ContextsPage() {
       active = false;
       setUnauthorizedHandler(null);
     };
-  }, []);
+  }, [resetInterviewState]);
 
   const handleLogout = async () => {
     try {
       await api.logout();
-    } finally {
       localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       setAuthUser(null);
+      resetInterviewState();
+    } catch {
+      setErrorMessage(
+        'Não foi possível encerrar a sessão. Tente novamente antes de sair.',
+      );
     }
   };
 

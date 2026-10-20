@@ -243,11 +243,14 @@ export default function Home() {
   const handleLogout = async () => {
     try {
       await api.logout();
-    } finally {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       setAuthUser(null);
       resetInterviewState();
+    } catch {
+      window.alert(
+        'Não foi possível encerrar a sessão. Tente novamente antes de sair.',
+      );
     }
   };
 
