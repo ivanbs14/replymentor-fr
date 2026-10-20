@@ -4,7 +4,7 @@ import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { FormEvent, useEffect, useState } from 'react';
-import { api, setApiToken, setUnauthorizedHandler } from '@/lib/api';
+import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 
@@ -26,23 +26,13 @@ export default function NewContextPage() {
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(null);
       setAuthUser(null);
       resetInterviewState();
     };
 
     setUnauthorizedHandler(handleUnauthorized);
 
-    const token = localStorage.getItem('replymentor_token');
-    if (!token) {
-      setApiToken(null);
-      setAuthUser(null);
-      return () => {
-        setUnauthorizedHandler(null);
-      };
-    }
-
-    setApiToken(token);
+    localStorage.removeItem('replymentor_token');
 
     api
       .me()

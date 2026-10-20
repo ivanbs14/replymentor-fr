@@ -2,11 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import {
-  api,
-  setApiToken,
-  setUnauthorizedHandler,
-} from '@/lib/api';
+import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 
@@ -54,7 +50,6 @@ export default function ContextsPage() {
 
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
-      setApiToken(null);
       if (active) {
         setAuthUser(null);
       }
@@ -62,15 +57,7 @@ export default function ContextsPage() {
 
     setUnauthorizedHandler(handleUnauthorized);
 
-    const token = localStorage.getItem('replymentor_token');
-    if (!token) {
-      return () => {
-        active = false;
-        setUnauthorizedHandler(null);
-      };
-    }
-
-    setApiToken(token);
+    localStorage.removeItem('replymentor_token');
 
     Promise.all([api.me(), api.getContexts()])
       .then(([user, storedContexts]) => {
@@ -96,10 +83,13 @@ export default function ContextsPage() {
     };
   }, []);
 
-  const handleLogout = () => {
-    localStorage.removeItem('replymentor_token');
-    setApiToken(null);
-    setAuthUser(null);
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      localStorage.removeItem('replymentor_token');
+      setAuthUser(null);
+    }
   };
 
   if (!authUser) {

@@ -3,7 +3,7 @@
 import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
-import { api, setApiToken, setUnauthorizedHandler } from '@/lib/api';
+import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 
@@ -73,23 +73,13 @@ export default function Home() {
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(null);
       setAuthUser(null);
       resetInterviewState();
     };
 
     setUnauthorizedHandler(handleUnauthorized);
 
-    const token = localStorage.getItem('replymentor_token');
-    if (!token) {
-      setAuthUser(null);
-      setApiToken(null);
-      return () => {
-        setUnauthorizedHandler(null);
-      };
-    }
-
-    setApiToken(token);
+    localStorage.removeItem('replymentor_token');
 
     api
       .me()
@@ -97,10 +87,7 @@ export default function Home() {
         setAuthUser({ id: user.id, email: user.email });
       })
       .catch(() => {
-        localStorage.removeItem('replymentor_token');
-        setApiToken(null);
-        setAuthUser(null);
-        resetInterviewState();
+        handleUnauthorized();
       });
 
     return () => {
@@ -128,9 +115,7 @@ export default function Home() {
         password: authPassword,
       }),
     onSuccess: (data) => {
-      localStorage.setItem('replymentor_token', data.accessToken);
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(data.accessToken);
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -144,9 +129,7 @@ export default function Home() {
         password: authPassword,
       }),
     onSuccess: (data) => {
-      localStorage.setItem('replymentor_token', data.accessToken);
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(data.accessToken);
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -257,12 +240,15 @@ export default function Home() {
     registerMutation.mutate();
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('replymentor_token');
-    localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-    setApiToken(null);
-    setAuthUser(null);
-    resetInterviewState();
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setAuthUser(null);
+      resetInterviewState();
+    }
   };
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {

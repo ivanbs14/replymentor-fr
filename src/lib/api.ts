@@ -1,12 +1,7 @@
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001';
 
-let authToken: string | null = null;
 let unauthorizedHandler: (() => void) | null = null;
-
-export function setApiToken(token: string | null) {
-  authToken = token;
-}
 
 export function setUnauthorizedHandler(handler: (() => void) | null) {
   unauthorizedHandler = handler;
@@ -26,9 +21,9 @@ type GenerateResponsePayload = {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -62,7 +57,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   register: (body: { email: string; password: string }) =>
     request<{
-      accessToken: string;
       user: { id: string; email: string };
     }>('/auth/register', {
       method: 'POST',
@@ -70,11 +64,15 @@ export const api = {
     }),
   login: (body: { email: string; password: string }) =>
     request<{
-      accessToken: string;
       user: { id: string; email: string };
     }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  logout: () =>
+    request<{ success: true }>('/auth/logout', {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
   me: () =>
     request<{
