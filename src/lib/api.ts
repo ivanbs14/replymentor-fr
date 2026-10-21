@@ -14,13 +14,13 @@ export function setUnauthorizedHandler(handler: (() => void) | null) {
   unauthorizedHandler = handler;
 }
 
-type AddTranscriptPayload = {
+export type AddTranscriptPayload = {
   transcript?: string;
   audioBase64?: string;
   mimeType?: string;
 };
 
-type GenerateResponsePayload = {
+export type GenerateResponsePayload = {
   provider?: LlmProvider;
   model?: string;
 };

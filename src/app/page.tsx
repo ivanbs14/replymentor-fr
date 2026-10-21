@@ -3,7 +3,12 @@
 import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
-import { api, setUnauthorizedHandler } from '@/lib/api';
+import {
+  api,
+  setUnauthorizedHandler,
+  type AddTranscriptPayload,
+  type GenerateResponsePayload,
+} from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 import {
@@ -16,8 +21,11 @@ import {
 
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
-type GenerateMutationKeys = {
+type GenerateOperation = {
+  sessionId: string;
+  transcriptPayload: AddTranscriptPayload;
   transcriptKey: string;
+  generationPayload: GenerateResponsePayload;
   generationKey: string;
 };
 
@@ -71,6 +79,7 @@ export default function Home() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingResolverRef = useRef<((file: File | null) => void) | null>(null);
+  const pendingGenerateOperationRef = useRef<GenerateOperation | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
@@ -153,6 +162,7 @@ export default function Home() {
       return api.startSession(contextId);
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       setSessionId(data.id);
       setSessionStatus('listening');
       void handleStartRecording();
@@ -161,44 +171,26 @@ export default function Home() {
 
   const generateResponseMutation = useMutation({
     mutationFn: async ({
+      sessionId: operationSessionId,
+      transcriptPayload,
       transcriptKey,
+      generationPayload,
       generationKey,
-    }: GenerateMutationKeys) => {
-      if (!sessionId) throw new Error('Inicie a sessão antes de gerar resposta.');
-      let capturedAudioFile = audioFile;
-
-      if (isRecording) {
-        capturedAudioFile = await stopRecordingAndWait();
-      }
-
-      const manualTranscript = transcriptInput.trim();
-      if (!manualTranscript && !capturedAudioFile) {
-        throw new Error('Adicione um transcript manual ou selecione um áudio para análise.');
-      }
-
+    }: GenerateOperation) => {
       setSessionStatus('processing');
-      if (manualTranscript) {
-        await api.addTranscript(
-          sessionId,
-          { transcript: manualTranscript },
-          transcriptKey,
-        );
-      } else if (capturedAudioFile) {
-        const audioError = validateAudioFile(capturedAudioFile);
-        if (audioError) throw new Error(audioError);
-        const audioBase64 = await fileToBase64(capturedAudioFile);
-        await api.addTranscript(sessionId, {
-          audioBase64,
-          mimeType: capturedAudioFile.type || 'audio/webm',
-        }, transcriptKey);
-      }
-
-      return api.generateResponse(sessionId, {
-        provider: selectedProvider,
-        model: selectedModel.trim() || undefined,
-      }, generationKey);
+      await api.addTranscript(
+        operationSessionId,
+        transcriptPayload,
+        transcriptKey,
+      );
+      return api.generateResponse(
+        operationSessionId,
+        generationPayload,
+        generationKey,
+      );
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       pushResponse(data);
       setTranscriptInput('');
       setAudioFile(null);
@@ -211,6 +203,7 @@ export default function Home() {
     },
     onError: (error) => {
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
+        pendingGenerateOperationRef.current = null;
         if (isRecording) void stopRecordingAndWait();
         setSessionId(null);
         setSessionStatus('closed');
@@ -226,6 +219,7 @@ export default function Home() {
       return api.endSession(sessionId);
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       if (isRecording) {
         void stopRecordingAndWait();
       }
@@ -283,6 +277,7 @@ export default function Home() {
   };
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
+    pendingGenerateOperationRef.current = null;
     const selectedFile = event.target.files?.[0] ?? null;
     if (selectedFile) {
       const error = validateAudioFile(selectedFile);
@@ -299,6 +294,7 @@ export default function Home() {
 
   const handleStartRecording = async () => {
     if (isRecording) return;
+    pendingGenerateOperationRef.current = null;
     if (!navigator.mediaDevices?.getUserMedia) {
       setRecordingError('Seu navegador não suporta captura de áudio por microfone.');
       return;
@@ -358,6 +354,7 @@ export default function Home() {
           return;
         }
 
+        pendingGenerateOperationRef.current = null;
         setAudioFile(capturedFile);
         setIsRecording(false);
 
@@ -405,6 +402,58 @@ export default function Home() {
       recordingResolverRef.current = resolve;
       recorder.stop();
     });
+  };
+
+  const handleGenerateResponse = async () => {
+    if (pendingGenerateOperationRef.current) {
+      generateResponseMutation.mutate(pendingGenerateOperationRef.current);
+      return;
+    }
+    if (!sessionId) {
+      setRecordingError('Inicie a sessão antes de gerar resposta.');
+      return;
+    }
+
+    let capturedAudioFile = audioFile;
+    if (isRecording) {
+      capturedAudioFile = await stopRecordingAndWait();
+    }
+    const manualTranscript = transcriptInput.trim();
+    if (!manualTranscript && !capturedAudioFile) {
+      setRecordingError(
+        'Adicione um transcript manual ou selecione um áudio para análise.',
+      );
+      return;
+    }
+
+    let transcriptPayload: AddTranscriptPayload;
+    if (manualTranscript) {
+      transcriptPayload = { transcript: manualTranscript };
+    } else {
+      const selectedAudio = capturedAudioFile!;
+      const audioError = validateAudioFile(selectedAudio);
+      if (audioError) {
+        setRecordingError(audioError);
+        return;
+      }
+      transcriptPayload = {
+        audioBase64: await fileToBase64(selectedAudio),
+        mimeType: selectedAudio.type || 'audio/webm',
+      };
+    }
+
+    const operation: GenerateOperation = {
+      sessionId,
+      transcriptPayload,
+      transcriptKey: crypto.randomUUID(),
+      generationPayload: {
+        provider: selectedProvider,
+        model: selectedModel.trim() || undefined,
+      },
+      generationKey: crypto.randomUUID(),
+    };
+    pendingGenerateOperationRef.current = operation;
+    generateResponseMutation.mutate(operation);
   };
 
   const handleStopRecording = () => {
@@ -655,12 +704,7 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() =>
-                    generateResponseMutation.mutate({
-                      transcriptKey: crypto.randomUUID(),
-                      generationKey: crypto.randomUUID(),
-                    })
-                  }
+                  onClick={() => void handleGenerateResponse()}
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#4b41e1] font-semibold text-white shadow-lg shadow-[#4b41e1]/20 hover:opacity-90 disabled:opacity-50"
                 >
@@ -669,12 +713,7 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() =>
-                    generateResponseMutation.mutate({
-                      transcriptKey: crypto.randomUUID(),
-                      generationKey: crypto.randomUUID(),
-                    })
-                  }
+                  onClick={() => void handleGenerateResponse()}
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#004ac6]/20 bg-white font-semibold text-[#004ac6] hover:bg-[#eff4ff] disabled:opacity-50"
                 >
@@ -703,9 +742,10 @@ export default function Home() {
                 </label>
                 <select
                   value={selectedProvider}
-                  onChange={(event) =>
-                    setSelectedProvider(event.target.value as LlmProvider)
-                  }
+                  onChange={(event) => {
+                    pendingGenerateOperationRef.current = null;
+                    setSelectedProvider(event.target.value as LlmProvider);
+                  }}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 >
                   <option value="gemini">Gemini</option>
@@ -717,7 +757,10 @@ export default function Home() {
                 </label>
                 <input
                   value={selectedModel}
-                  onChange={(event) => setSelectedModel(event.target.value)}
+                  onChange={(event) => {
+                    pendingGenerateOperationRef.current = null;
+                    setSelectedModel(event.target.value);
+                  }}
                   placeholder={`Padrão do backend para ${providerLabelMap[selectedProvider]}`}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 />
@@ -844,7 +887,10 @@ export default function Home() {
                 rows={4}
                 value={transcriptInput}
                 maxLength={MAX_TRANSCRIPT_CHARS}
-                onChange={(event) => setTranscriptInput(event.target.value)}
+                onChange={(event) => {
+                  pendingGenerateOperationRef.current = null;
+                  setTranscriptInput(event.target.value);
+                }}
                 placeholder="Cole aqui a última fala/pergunta do entrevistador..."
               />
               <div className="mt-3 rounded-xl border border-[#c3c6d7] bg-[#f8f9ff] p-4">
