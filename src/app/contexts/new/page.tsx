@@ -7,6 +7,12 @@ import { FormEvent, useEffect, useState } from 'react';
 import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
+import {
+  INTERVIEW_TYPES,
+  JOB_LEVELS,
+  RESPONSE_PREFERENCES,
+  validateInterviewContext,
+} from '@/lib/interview-contract';
 
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
@@ -73,6 +79,11 @@ export default function NewContextPage() {
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     setErrorMessage(null);
+    const validationError = validateInterviewContext(contextForm);
+    if (validationError) {
+      setErrorMessage(validationError);
+      return;
+    }
     createContextMutation.mutate();
   };
 
@@ -152,6 +163,8 @@ export default function NewContextPage() {
               className="mt-4 w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] leading-6 outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
               rows={6}
               required
+              minLength={50}
+              maxLength={12000}
               value={contextForm.resumeText}
               onChange={(event) => setContextField('resumeText', event.target.value)}
               placeholder="Ex: Desenvolvedor Senior com 8 anos de experiência em React, Node.js e arquitetura de sistemas..."
@@ -169,18 +182,13 @@ export default function NewContextPage() {
                 label="Tipo de entrevista"
                 value={contextForm.interviewType}
                 onChange={(value) => setContextField('interviewType', value)}
-                options={[
-                  'Técnica (Coding/System Design)',
-                  'Comportamental (Soft Skills)',
-                  'Conversa com RH',
-                  'Cultural Fit',
-                ]}
+                options={[...INTERVIEW_TYPES]}
               />
               <SelectField
                 label="Nível da vaga"
                 value={contextForm.jobLevel}
                 onChange={(value) => setContextField('jobLevel', value)}
-                options={['Júnior', 'Pleno', 'Sênior', 'Tech Lead']}
+                options={[...JOB_LEVELS]}
               />
               <div className="space-y-2 md:col-span-2">
                 <label className="text-sm font-medium text-[#0d1c2e]">Descrição da vaga (JD)</label>
@@ -188,6 +196,8 @@ export default function NewContextPage() {
                   className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                   rows={4}
                   required
+                  minLength={20}
+                  maxLength={8000}
                   value={contextForm.jobDescription}
                   onChange={(event) => setContextField('jobDescription', event.target.value)}
                   placeholder="Cole aqui os requisitos e responsabilidades descritos na vaga..."
@@ -209,12 +219,14 @@ export default function NewContextPage() {
                 onChange={(value) => setContextField('companyName', value)}
                 placeholder="Ex: Google, Stripe, Nubank..."
                 required
+                maxLength={120}
               />
               <div className="space-y-2">
                 <label className="text-sm font-medium text-[#0d1c2e]">Contexto da empresa</label>
                 <textarea
                   className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                   rows={3}
+                  maxLength={1000}
                   value={contextForm.companySegment}
                   onChange={(event) => setContextField('companySegment', event.target.value)}
                   placeholder="Cultura, produtos principais ou notícias recentes..."
@@ -234,6 +246,7 @@ export default function NewContextPage() {
               <textarea
                 className="w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 rows={3}
+                maxLength={280}
                 value={contextForm.aiBehavior}
                 onChange={(event) => setContextField('aiBehavior', event.target.value)}
                 placeholder='Ex: "Quero que você aja como se fosse o entrevistado e responda em primeira pessoa com tom confiante e objetivo."'
@@ -250,18 +263,18 @@ export default function NewContextPage() {
             <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
               {[
                 {
-                  key: 'direta e curta',
+                  key: RESPONSE_PREFERENCES[0],
                   title: 'Direta e curta',
                   desc: 'Ideal para entrevistas técnicas rápidas.',
                 },
                 {
-                  key: 'equilibrada',
+                  key: RESPONSE_PREFERENCES[1],
                   title: 'Equilibrada',
                   desc: 'Tom profissional com contexto suficiente.',
                 },
                 {
-                  key: 'mais detalhada',
-                  title: 'Mais detalhada',
+                  key: RESPONSE_PREFERENCES[2],
+                  title: 'Detalhada e didática',
                   desc: 'Explicações profundas e estruturadas.',
                 },
               ].map((item) => {
@@ -354,12 +367,14 @@ function InputField({
   onChange,
   placeholder,
   required = false,
+  maxLength,
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
   required?: boolean;
+  maxLength?: number;
 }) {
   return (
     <div className="space-y-2">
@@ -369,6 +384,7 @@ function InputField({
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         required={required}
+        maxLength={maxLength}
         className="h-12 w-full rounded-xl border border-[#c3c6d7] bg-white px-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
       />
     </div>

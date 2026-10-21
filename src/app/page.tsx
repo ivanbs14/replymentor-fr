@@ -6,8 +6,13 @@ import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
 import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
+import {
+  AUDIO_ACCEPT,
+  MAX_TRANSCRIPT_CHARS,
+  type LlmProvider,
+  validateAudioFile,
+} from '@/lib/interview-contract';
 
-type LlmProvider = 'gemini' | 'ollama' | 'openai';
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
 function statusLabel(status: string) {
@@ -166,6 +171,8 @@ export default function Home() {
       if (manualTranscript) {
         await api.addTranscript(sessionId, { transcript: manualTranscript });
       } else if (capturedAudioFile) {
+        const audioError = validateAudioFile(capturedAudioFile);
+        if (audioError) throw new Error(audioError);
         const audioBase64 = await fileToBase64(capturedAudioFile);
         await api.addTranscript(sessionId, {
           audioBase64,
@@ -256,6 +263,15 @@ export default function Home() {
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0] ?? null;
+    if (selectedFile) {
+      const error = validateAudioFile(selectedFile);
+      if (error) {
+        setAudioFile(null);
+        setRecordingError(error);
+        event.target.value = '';
+        return;
+      }
+    }
     setAudioFile(selectedFile);
     setRecordingError(null);
   };
@@ -308,6 +324,18 @@ export default function Home() {
         const capturedFile = new File([blob], `captura-${Date.now()}.${extension}`, {
           type: blob.type || 'audio/webm',
         });
+
+        const audioError = validateAudioFile(capturedFile);
+        if (audioError) {
+          setRecordingError(audioError);
+          setIsRecording(false);
+          mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+          mediaStreamRef.current = null;
+          mediaRecorderRef.current = null;
+          recordingResolverRef.current?.(null);
+          recordingResolverRef.current = null;
+          return;
+        }
 
         setAudioFile(capturedFile);
         setIsRecording(false);
@@ -393,6 +421,8 @@ export default function Home() {
               <input
                 type="email"
                 required
+                minLength={3}
+                maxLength={254}
                 value={authEmail}
                 onChange={(event) => setAuthEmail(event.target.value)}
                 className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -403,7 +433,8 @@ export default function Home() {
               <input
                 type="password"
                 required
-                minLength={6}
+                minLength={8}
+                maxLength={128}
                 value={authPassword}
                 onChange={(event) => setAuthPassword(event.target.value)}
                 className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -781,6 +812,7 @@ export default function Home() {
                 className="mt-2 w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 rows={4}
                 value={transcriptInput}
+                maxLength={MAX_TRANSCRIPT_CHARS}
                 onChange={(event) => setTranscriptInput(event.target.value)}
                 placeholder="Cole aqui a última fala/pergunta do entrevistador..."
               />
@@ -809,7 +841,7 @@ export default function Home() {
                 <input
                   ref={audioInputRef}
                   type="file"
-                  accept="audio/*"
+                  accept={AUDIO_ACCEPT}
                   onChange={handleAudioSelection}
                   className="block w-full text-sm text-[#434655] file:mr-0 file:w-full file:rounded-lg file:border-0 file:bg-[#004ac6] file:px-3 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:opacity-90"
                 />

@@ -1,3 +1,9 @@
+import {
+  parseApiErrorMessage,
+  type InterviewContextInput,
+  type LlmProvider,
+} from './interview-contract';
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001';
 
@@ -14,7 +20,7 @@ type AddTranscriptPayload = {
 };
 
 type GenerateResponsePayload = {
-  provider?: 'gemini' | 'ollama' | 'openai';
+  provider?: LlmProvider;
   model?: string;
 };
 
@@ -34,21 +40,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const raw = await response.text();
-    let parsedMessage: string | null = null;
-
-    try {
-      const parsed = JSON.parse(raw) as { message?: string | string[] };
-      if (Array.isArray(parsed.message) && parsed.message.length > 0) {
-        parsedMessage = parsed.message.join(' ');
-      }
-      if (!parsedMessage && typeof parsed.message === 'string' && parsed.message.trim().length > 0) {
-        parsedMessage = parsed.message.trim();
-      }
-    } catch {
-      // Se não for JSON válido, usa o corpo bruto retornado pela API.
-    }
-
-    throw new Error(parsedMessage || raw || 'Erro de requisição');
+    throw new Error(parseApiErrorMessage(raw));
   }
 
   return response.json() as Promise<T>;
@@ -112,7 +104,7 @@ export const api = {
         latestSessionStatus: 'ACTIVE' | 'CLOSED' | null;
       }>
     >('/interview/contexts'),
-  createContext: (body: Record<string, unknown>) =>
+  createContext: (body: Omit<InterviewContextInput, 'aiBehavior'> & { aiBehavior?: string }) =>
     request<{ id: string }>('/interview/context', {
       method: 'POST',
       body: JSON.stringify(body),
