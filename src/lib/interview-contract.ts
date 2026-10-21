@@ -35,16 +35,42 @@ export type InterviewContextInput = {
   aiBehavior: string;
 };
 
-export function parseApiErrorMessage(raw: string): string {
+export type ParsedApiError = {
+  message: string;
+  statusCode?: number;
+  code?: string;
+};
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode?: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+export function parseApiError(raw: string): ParsedApiError {
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return 'Erro de requisição';
+    if (typeof parsed !== 'object' || parsed === null) {
+      return { message: 'Erro de requisição' };
+    }
     const message = Reflect.get(parsed, 'message');
-    return typeof message === 'string' && message.trim().length > 0
-      ? message.trim()
-      : 'Erro de requisição';
+    const statusCode = Reflect.get(parsed, 'statusCode');
+    const code = Reflect.get(parsed, 'code');
+    return {
+      message:
+        typeof message === 'string' && message.trim().length > 0
+          ? message.trim()
+          : 'Erro de requisição',
+      ...(typeof statusCode === 'number' ? { statusCode } : {}),
+      ...(typeof code === 'string' ? { code } : {}),
+    };
   } catch {
-    return 'Erro de requisição';
+    return { message: 'Erro de requisição' };
   }
 }
 

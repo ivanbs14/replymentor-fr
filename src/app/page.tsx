@@ -8,12 +8,18 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 import {
   AUDIO_ACCEPT,
+  ApiError,
   MAX_TRANSCRIPT_CHARS,
   type LlmProvider,
   validateAudioFile,
 } from '@/lib/interview-contract';
 
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
+
+type GenerateMutationKeys = {
+  transcriptKey: string;
+  generationKey: string;
+};
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
@@ -154,7 +160,10 @@ export default function Home() {
   });
 
   const generateResponseMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async ({
+      transcriptKey,
+      generationKey,
+    }: GenerateMutationKeys) => {
       if (!sessionId) throw new Error('Inicie a sessão antes de gerar resposta.');
       let capturedAudioFile = audioFile;
 
@@ -169,7 +178,11 @@ export default function Home() {
 
       setSessionStatus('processing');
       if (manualTranscript) {
-        await api.addTranscript(sessionId, { transcript: manualTranscript });
+        await api.addTranscript(
+          sessionId,
+          { transcript: manualTranscript },
+          transcriptKey,
+        );
       } else if (capturedAudioFile) {
         const audioError = validateAudioFile(capturedAudioFile);
         if (audioError) throw new Error(audioError);
@@ -177,13 +190,13 @@ export default function Home() {
         await api.addTranscript(sessionId, {
           audioBase64,
           mimeType: capturedAudioFile.type || 'audio/webm',
-        });
+        }, transcriptKey);
       }
 
       return api.generateResponse(sessionId, {
         provider: selectedProvider,
         model: selectedModel.trim() || undefined,
-      });
+      }, generationKey);
     },
     onSuccess: (data) => {
       pushResponse(data);
@@ -196,7 +209,15 @@ export default function Home() {
       // Keep continuous capture cycles until the user explicitly ends the session.
       void handleStartRecording();
     },
-    onError: () => setSessionStatus('listening'),
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
+        if (isRecording) void stopRecordingAndWait();
+        setSessionId(null);
+        setSessionStatus('closed');
+        return;
+      }
+      setSessionStatus('listening');
+    },
   });
 
   const endSessionMutation = useMutation({
@@ -634,7 +655,12 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => generateResponseMutation.mutate()}
+                  onClick={() =>
+                    generateResponseMutation.mutate({
+                      transcriptKey: crypto.randomUUID(),
+                      generationKey: crypto.randomUUID(),
+                    })
+                  }
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#4b41e1] font-semibold text-white shadow-lg shadow-[#4b41e1]/20 hover:opacity-90 disabled:opacity-50"
                 >
@@ -643,7 +669,12 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => generateResponseMutation.mutate()}
+                  onClick={() =>
+                    generateResponseMutation.mutate({
+                      transcriptKey: crypto.randomUUID(),
+                      generationKey: crypto.randomUUID(),
+                    })
+                  }
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#004ac6]/20 bg-white font-semibold text-[#004ac6] hover:bg-[#eff4ff] disabled:opacity-50"
                 >

@@ -1,5 +1,6 @@
 import {
-  parseApiErrorMessage,
+  ApiError,
+  parseApiError,
   type InterviewContextInput,
   type LlmProvider,
 } from './interview-contract';
@@ -40,7 +41,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const raw = await response.text();
-    throw new Error(parseApiErrorMessage(raw));
+    const parsed = parseApiError(raw);
+    throw new ApiError(parsed.message, parsed.statusCode, parsed.code);
   }
 
   return response.json() as Promise<T>;
@@ -114,12 +116,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ contextId }),
     }),
-  addTranscript: (sessionId: string, payload: AddTranscriptPayload) =>
+  addTranscript: (
+    sessionId: string,
+    payload: AddTranscriptPayload,
+    idempotencyKey: string,
+  ) =>
     request<{ id: string }>(`/interview/sessions/${sessionId}/transcripts`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(payload),
     }),
-  generateResponse: (sessionId: string, payload?: GenerateResponsePayload) =>
+  generateResponse: (
+    sessionId: string,
+    payload: GenerateResponsePayload | undefined,
+    idempotencyKey: string,
+  ) =>
     request<{
       id: string;
       detectedQuestion: string;
@@ -130,6 +141,7 @@ export const api = {
       createdAt: string;
     }>(`/interview/sessions/${sessionId}/generate-response`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(payload ?? {}),
     }),
   endSession: (sessionId: string) =>
