@@ -3,12 +3,31 @@
 import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
-import { api, setApiToken, setUnauthorizedHandler } from '@/lib/api';
+import {
+  api,
+  setUnauthorizedHandler,
+  type AddTranscriptPayload,
+  type GenerateResponsePayload,
+} from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
+import {
+  AUDIO_ACCEPT,
+  ApiError,
+  MAX_TRANSCRIPT_CHARS,
+  type LlmProvider,
+  validateAudioFile,
+} from '@/lib/interview-contract';
 
-type LlmProvider = 'gemini' | 'ollama' | 'openai';
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
+
+type GenerateOperation = {
+  sessionId: string;
+  transcriptPayload: AddTranscriptPayload;
+  transcriptKey: string;
+  generationPayload: GenerateResponsePayload;
+  generationKey: string;
+};
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
@@ -60,6 +79,7 @@ export default function Home() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingResolverRef = useRef<((file: File | null) => void) | null>(null);
+  const pendingGenerateOperationRef = useRef<GenerateOperation | null>(null);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
@@ -73,23 +93,13 @@ export default function Home() {
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(null);
       setAuthUser(null);
       resetInterviewState();
     };
 
     setUnauthorizedHandler(handleUnauthorized);
 
-    const token = localStorage.getItem('replymentor_token');
-    if (!token) {
-      setAuthUser(null);
-      setApiToken(null);
-      return () => {
-        setUnauthorizedHandler(null);
-      };
-    }
-
-    setApiToken(token);
+    localStorage.removeItem('replymentor_token');
 
     api
       .me()
@@ -97,10 +107,7 @@ export default function Home() {
         setAuthUser({ id: user.id, email: user.email });
       })
       .catch(() => {
-        localStorage.removeItem('replymentor_token');
-        setApiToken(null);
-        setAuthUser(null);
-        resetInterviewState();
+        handleUnauthorized();
       });
 
     return () => {
@@ -128,9 +135,7 @@ export default function Home() {
         password: authPassword,
       }),
     onSuccess: (data) => {
-      localStorage.setItem('replymentor_token', data.accessToken);
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(data.accessToken);
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -144,9 +149,7 @@ export default function Home() {
         password: authPassword,
       }),
     onSuccess: (data) => {
-      localStorage.setItem('replymentor_token', data.accessToken);
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-      setApiToken(data.accessToken);
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -159,6 +162,7 @@ export default function Home() {
       return api.startSession(contextId);
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       setSessionId(data.id);
       setSessionStatus('listening');
       void handleStartRecording();
@@ -166,36 +170,27 @@ export default function Home() {
   });
 
   const generateResponseMutation = useMutation({
-    mutationFn: async () => {
-      if (!sessionId) throw new Error('Inicie a sessão antes de gerar resposta.');
-      let capturedAudioFile = audioFile;
-
-      if (isRecording) {
-        capturedAudioFile = await stopRecordingAndWait();
-      }
-
-      const manualTranscript = transcriptInput.trim();
-      if (!manualTranscript && !capturedAudioFile) {
-        throw new Error('Adicione um transcript manual ou selecione um áudio para análise.');
-      }
-
+    mutationFn: async ({
+      sessionId: operationSessionId,
+      transcriptPayload,
+      transcriptKey,
+      generationPayload,
+      generationKey,
+    }: GenerateOperation) => {
       setSessionStatus('processing');
-      if (manualTranscript) {
-        await api.addTranscript(sessionId, { transcript: manualTranscript });
-      } else if (capturedAudioFile) {
-        const audioBase64 = await fileToBase64(capturedAudioFile);
-        await api.addTranscript(sessionId, {
-          audioBase64,
-          mimeType: capturedAudioFile.type || 'audio/webm',
-        });
-      }
-
-      return api.generateResponse(sessionId, {
-        provider: selectedProvider,
-        model: selectedModel.trim() || undefined,
-      });
+      await api.addTranscript(
+        operationSessionId,
+        transcriptPayload,
+        transcriptKey,
+      );
+      return api.generateResponse(
+        operationSessionId,
+        generationPayload,
+        generationKey,
+      );
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       pushResponse(data);
       setTranscriptInput('');
       setAudioFile(null);
@@ -206,7 +201,16 @@ export default function Home() {
       // Keep continuous capture cycles until the user explicitly ends the session.
       void handleStartRecording();
     },
-    onError: () => setSessionStatus('listening'),
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
+        pendingGenerateOperationRef.current = null;
+        if (isRecording) void stopRecordingAndWait();
+        setSessionId(null);
+        setSessionStatus('closed');
+        return;
+      }
+      setSessionStatus('listening');
+    },
   });
 
   const endSessionMutation = useMutation({
@@ -215,6 +219,7 @@ export default function Home() {
       return api.endSession(sessionId);
     },
     onSuccess: (data) => {
+      pendingGenerateOperationRef.current = null;
       if (isRecording) {
         void stopRecordingAndWait();
       }
@@ -257,22 +262,39 @@ export default function Home() {
     registerMutation.mutate();
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('replymentor_token');
-    localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
-    setApiToken(null);
-    setAuthUser(null);
-    resetInterviewState();
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+      localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setAuthUser(null);
+      resetInterviewState();
+    } catch {
+      window.alert(
+        'Não foi possível encerrar a sessão. Tente novamente antes de sair.',
+      );
+    }
   };
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
+    pendingGenerateOperationRef.current = null;
     const selectedFile = event.target.files?.[0] ?? null;
+    if (selectedFile) {
+      const error = validateAudioFile(selectedFile);
+      if (error) {
+        setAudioFile(null);
+        setRecordingError(error);
+        event.target.value = '';
+        return;
+      }
+    }
     setAudioFile(selectedFile);
     setRecordingError(null);
   };
 
   const handleStartRecording = async () => {
     if (isRecording) return;
+    pendingGenerateOperationRef.current = null;
     if (!navigator.mediaDevices?.getUserMedia) {
       setRecordingError('Seu navegador não suporta captura de áudio por microfone.');
       return;
@@ -320,6 +342,19 @@ export default function Home() {
           type: blob.type || 'audio/webm',
         });
 
+        const audioError = validateAudioFile(capturedFile);
+        if (audioError) {
+          setRecordingError(audioError);
+          setIsRecording(false);
+          mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+          mediaStreamRef.current = null;
+          mediaRecorderRef.current = null;
+          recordingResolverRef.current?.(null);
+          recordingResolverRef.current = null;
+          return;
+        }
+
+        pendingGenerateOperationRef.current = null;
         setAudioFile(capturedFile);
         setIsRecording(false);
 
@@ -369,6 +404,58 @@ export default function Home() {
     });
   };
 
+  const handleGenerateResponse = async () => {
+    if (pendingGenerateOperationRef.current) {
+      generateResponseMutation.mutate(pendingGenerateOperationRef.current);
+      return;
+    }
+    if (!sessionId) {
+      setRecordingError('Inicie a sessão antes de gerar resposta.');
+      return;
+    }
+
+    let capturedAudioFile = audioFile;
+    if (isRecording) {
+      capturedAudioFile = await stopRecordingAndWait();
+    }
+    const manualTranscript = transcriptInput.trim();
+    if (!manualTranscript && !capturedAudioFile) {
+      setRecordingError(
+        'Adicione um transcript manual ou selecione um áudio para análise.',
+      );
+      return;
+    }
+
+    let transcriptPayload: AddTranscriptPayload;
+    if (manualTranscript) {
+      transcriptPayload = { transcript: manualTranscript };
+    } else {
+      const selectedAudio = capturedAudioFile!;
+      const audioError = validateAudioFile(selectedAudio);
+      if (audioError) {
+        setRecordingError(audioError);
+        return;
+      }
+      transcriptPayload = {
+        audioBase64: await fileToBase64(selectedAudio),
+        mimeType: selectedAudio.type || 'audio/webm',
+      };
+    }
+
+    const operation: GenerateOperation = {
+      sessionId,
+      transcriptPayload,
+      transcriptKey: crypto.randomUUID(),
+      generationPayload: {
+        provider: selectedProvider,
+        model: selectedModel.trim() || undefined,
+      },
+      generationKey: crypto.randomUUID(),
+    };
+    pendingGenerateOperationRef.current = operation;
+    generateResponseMutation.mutate(operation);
+  };
+
   const handleStopRecording = () => {
     void stopRecordingAndWait();
   };
@@ -404,6 +491,8 @@ export default function Home() {
               <input
                 type="email"
                 required
+                minLength={3}
+                maxLength={254}
                 value={authEmail}
                 onChange={(event) => setAuthEmail(event.target.value)}
                 className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -414,7 +503,8 @@ export default function Home() {
               <input
                 type="password"
                 required
-                minLength={6}
+                minLength={8}
+                maxLength={128}
                 value={authPassword}
                 onChange={(event) => setAuthPassword(event.target.value)}
                 className="h-11 w-full rounded-xl border border-[#c3c6d7] px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -614,7 +704,7 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => generateResponseMutation.mutate()}
+                  onClick={() => void handleGenerateResponse()}
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#4b41e1] font-semibold text-white shadow-lg shadow-[#4b41e1]/20 hover:opacity-90 disabled:opacity-50"
                 >
@@ -623,7 +713,7 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => generateResponseMutation.mutate()}
+                  onClick={() => void handleGenerateResponse()}
                   disabled={!sessionId || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#004ac6]/20 bg-white font-semibold text-[#004ac6] hover:bg-[#eff4ff] disabled:opacity-50"
                 >
@@ -652,9 +742,10 @@ export default function Home() {
                 </label>
                 <select
                   value={selectedProvider}
-                  onChange={(event) =>
-                    setSelectedProvider(event.target.value as LlmProvider)
-                  }
+                  onChange={(event) => {
+                    pendingGenerateOperationRef.current = null;
+                    setSelectedProvider(event.target.value as LlmProvider);
+                  }}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 >
                   <option value="gemini">Gemini</option>
@@ -666,7 +757,10 @@ export default function Home() {
                 </label>
                 <input
                   value={selectedModel}
-                  onChange={(event) => setSelectedModel(event.target.value)}
+                  onChange={(event) => {
+                    pendingGenerateOperationRef.current = null;
+                    setSelectedModel(event.target.value);
+                  }}
                   placeholder={`Padrão do backend para ${providerLabelMap[selectedProvider]}`}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 />
@@ -792,7 +886,11 @@ export default function Home() {
                 className="mt-2 w-full rounded-xl border border-[#c3c6d7] bg-white p-4 text-[16px] outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
                 rows={4}
                 value={transcriptInput}
-                onChange={(event) => setTranscriptInput(event.target.value)}
+                maxLength={MAX_TRANSCRIPT_CHARS}
+                onChange={(event) => {
+                  pendingGenerateOperationRef.current = null;
+                  setTranscriptInput(event.target.value);
+                }}
                 placeholder="Cole aqui a última fala/pergunta do entrevistador..."
               />
               <div className="mt-3 rounded-xl border border-[#c3c6d7] bg-[#f8f9ff] p-4">
@@ -820,7 +918,7 @@ export default function Home() {
                 <input
                   ref={audioInputRef}
                   type="file"
-                  accept="audio/*"
+                  accept={AUDIO_ACCEPT}
                   onChange={handleAudioSelection}
                   className="block w-full text-sm text-[#434655] file:mr-0 file:w-full file:rounded-lg file:border-0 file:bg-[#004ac6] file:px-3 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:opacity-90"
                 />

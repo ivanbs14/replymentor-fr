@@ -1,34 +1,36 @@
+import {
+  ApiError,
+  parseApiError,
+  type InterviewContextInput,
+  type LlmProvider,
+} from './interview-contract';
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:3001';
 
-let authToken: string | null = null;
 let unauthorizedHandler: (() => void) | null = null;
-
-export function setApiToken(token: string | null) {
-  authToken = token;
-}
 
 export function setUnauthorizedHandler(handler: (() => void) | null) {
   unauthorizedHandler = handler;
 }
 
-type AddTranscriptPayload = {
+export type AddTranscriptPayload = {
   transcript?: string;
   audioBase64?: string;
   mimeType?: string;
 };
 
-type GenerateResponsePayload = {
-  provider?: 'gemini' | 'ollama' | 'openai';
+export type GenerateResponsePayload = {
+  provider?: LlmProvider;
   model?: string;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -39,21 +41,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const raw = await response.text();
-    let parsedMessage: string | null = null;
-
-    try {
-      const parsed = JSON.parse(raw) as { message?: string | string[] };
-      if (Array.isArray(parsed.message) && parsed.message.length > 0) {
-        parsedMessage = parsed.message.join(' ');
-      }
-      if (!parsedMessage && typeof parsed.message === 'string' && parsed.message.trim().length > 0) {
-        parsedMessage = parsed.message.trim();
-      }
-    } catch {
-      // Se não for JSON válido, usa o corpo bruto retornado pela API.
-    }
-
-    throw new Error(parsedMessage || raw || 'Erro de requisição');
+    const parsed = parseApiError(raw);
+    throw new ApiError(parsed.message, parsed.statusCode, parsed.code);
   }
 
   return response.json() as Promise<T>;
@@ -62,7 +51,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   register: (body: { email: string; password: string }) =>
     request<{
-      accessToken: string;
       user: { id: string; email: string };
     }>('/auth/register', {
       method: 'POST',
@@ -70,11 +58,15 @@ export const api = {
     }),
   login: (body: { email: string; password: string }) =>
     request<{
-      accessToken: string;
       user: { id: string; email: string };
     }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  logout: () =>
+    request<{ success: true }>('/auth/logout', {
+      method: 'POST',
+      body: JSON.stringify({}),
     }),
   me: () =>
     request<{
@@ -114,7 +106,7 @@ export const api = {
         latestSessionStatus: 'ACTIVE' | 'CLOSED' | null;
       }>
     >('/interview/contexts'),
-  createContext: (body: Record<string, unknown>) =>
+  createContext: (body: Omit<InterviewContextInput, 'aiBehavior'> & { aiBehavior?: string }) =>
     request<{ id: string }>('/interview/context', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -124,12 +116,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ contextId }),
     }),
-  addTranscript: (sessionId: string, payload: AddTranscriptPayload) =>
+  addTranscript: (
+    sessionId: string,
+    payload: AddTranscriptPayload,
+    idempotencyKey: string,
+  ) =>
     request<{ id: string }>(`/interview/sessions/${sessionId}/transcripts`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(payload),
     }),
-  generateResponse: (sessionId: string, payload?: GenerateResponsePayload) =>
+  generateResponse: (
+    sessionId: string,
+    payload: GenerateResponsePayload | undefined,
+    idempotencyKey: string,
+  ) =>
     request<{
       id: string;
       detectedQuestion: string;
@@ -140,6 +141,7 @@ export const api = {
       createdAt: string;
     }>(`/interview/sessions/${sessionId}/generate-response`, {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(payload ?? {}),
     }),
   endSession: (sessionId: string) =>

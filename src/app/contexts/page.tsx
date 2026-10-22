@@ -2,11 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
-import {
-  api,
-  setApiToken,
-  setUnauthorizedHandler,
-} from '@/lib/api';
+import { api, setUnauthorizedHandler } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
 
@@ -41,7 +37,7 @@ function compactText(text: string, max = 150) {
 }
 
 export default function ContextsPage() {
-  const { setContextId } = useInterviewStore();
+  const { resetInterviewState, setContextId } = useInterviewStore();
   const [authUser, setAuthUser] = useState<{ id: string; email: string } | null>(
     null,
   );
@@ -54,23 +50,16 @@ export default function ContextsPage() {
 
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
-      setApiToken(null);
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       if (active) {
         setAuthUser(null);
+        resetInterviewState();
       }
     };
 
     setUnauthorizedHandler(handleUnauthorized);
 
-    const token = localStorage.getItem('replymentor_token');
-    if (!token) {
-      return () => {
-        active = false;
-        setUnauthorizedHandler(null);
-      };
-    }
-
-    setApiToken(token);
+    localStorage.removeItem('replymentor_token');
 
     Promise.all([api.me(), api.getContexts()])
       .then(([user, storedContexts]) => {
@@ -94,12 +83,20 @@ export default function ContextsPage() {
       active = false;
       setUnauthorizedHandler(null);
     };
-  }, []);
+  }, [resetInterviewState]);
 
-  const handleLogout = () => {
-    localStorage.removeItem('replymentor_token');
-    setApiToken(null);
-    setAuthUser(null);
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+      localStorage.removeItem('replymentor_token');
+      localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      setAuthUser(null);
+      resetInterviewState();
+    } catch {
+      setErrorMessage(
+        'Não foi possível encerrar a sessão. Tente novamente antes de sair.',
+      );
+    }
   };
 
   if (!authUser) {

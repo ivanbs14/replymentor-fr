@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { INTERVIEW_TYPES, RESPONSE_PREFERENCES } from './interview-contract';
 
 export type ResponseCard = {
   id: string;
@@ -46,12 +47,12 @@ export const useInterviewStore = create<InterviewState>((set) => ({
   authUser: null,
   contextForm: {
     resumeText: '',
-    interviewType: 'Técnica',
+    interviewType: INTERVIEW_TYPES[0],
     jobLevel: 'Pleno',
     jobDescription: '',
     companyName: '',
     companySegment: '',
-    responsePreference: 'equilibrada',
+    responsePreference: RESPONSE_PREFERENCES[1],
     aiBehavior: '',
   },
   contextId: null,
@@ -66,12 +67,12 @@ export const useInterviewStore = create<InterviewState>((set) => ({
     set({
       contextForm: {
         resumeText: '',
-        interviewType: 'Técnica',
+        interviewType: INTERVIEW_TYPES[0],
         jobLevel: 'Pleno',
         jobDescription: '',
         companyName: '',
         companySegment: '',
-        responsePreference: 'equilibrada',
+        responsePreference: RESPONSE_PREFERENCES[1],
         aiBehavior: '',
       },
       contextId: null,
