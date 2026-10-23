@@ -32,6 +32,23 @@ const response = {
   strategicNote: 'Explique um caso de projeto.',
   createdAt: '2026-10-22T12:00:00.000Z',
 };
+const answerReadyResponse = {
+  ...response,
+  status: 'ANSWER_READY' as const,
+  detection: {
+    id: 'detection-test',
+    status: 'DETECTED' as const,
+    question: response.detectedQuestion,
+    confidence: null,
+    source: 'LEGACY' as const,
+    evidence: [],
+    detectorVersion: 'legacy-v1',
+    provider: null,
+    model: null,
+    createdAt: response.createdAt,
+  },
+  answer: response,
+};
 const stopTrack = vi.fn();
 const getUserMedia = vi.fn();
 const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
@@ -192,7 +209,7 @@ describe('Home interview session', () => {
     vi.mocked(api.startSession).mockResolvedValue({ id: 'session-test' });
     vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
     vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo simulado da entrevista.' });
-    let resolveGeneration!: (value: typeof response) => void;
+    let resolveGeneration!: (value: typeof answerReadyResponse) => void;
     vi.mocked(api.generateResponse).mockImplementation(() => new Promise((resolve) => {
       resolveGeneration = resolve;
     }));
@@ -225,7 +242,7 @@ describe('Home interview session', () => {
       '00000000-0000-4000-8000-000000000002',
     );
     expect(screen.getByRole('button', { name: /Gerar resposta/ })).toBeDisabled();
-    act(() => resolveGeneration(response));
+    act(() => resolveGeneration(answerReadyResponse));
 
     expect(await screen.findByText(response.suggestedAnswer)).toBeVisible();
     expect(screen.getByText(response.shortVersion)).toBeVisible();

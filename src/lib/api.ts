@@ -25,6 +25,41 @@ export type GenerateResponsePayload = {
   model?: string;
 };
 
+export type QuestionDetection = {
+  id: string;
+  status: 'DETECTED' | 'NOT_FOUND';
+  question: string | null;
+  confidence: number | null;
+  source: 'LEGACY' | 'DETERMINISTIC' | 'LLM' | 'MANUAL';
+  evidence: Array<{ chunkId: string; sequence: number; excerpt: string }>;
+  detectorVersion: string;
+  provider: string | null;
+  model: string | null;
+  createdAt: string;
+};
+
+export type SuggestedAnswerResponse = {
+  id: string;
+  detectedQuestion: string;
+  suggestedAnswer: string;
+  shortVersion: string;
+  keyPoints: string[];
+  strategicNote: string;
+  createdAt: string;
+};
+
+export type GenerateResponseResult =
+  | (SuggestedAnswerResponse & {
+      status: 'ANSWER_READY';
+      detection: QuestionDetection;
+      answer: SuggestedAnswerResponse;
+    })
+  | {
+      status: 'NEEDS_CONFIRMATION';
+      detection: QuestionDetection;
+      answer: null;
+    };
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
@@ -131,15 +166,7 @@ export const api = {
     payload: GenerateResponsePayload | undefined,
     idempotencyKey: string,
   ) =>
-    request<{
-      id: string;
-      detectedQuestion: string;
-      suggestedAnswer: string;
-      shortVersion: string;
-      keyPoints: string[];
-      strategicNote: string;
-      createdAt: string;
-    }>(`/interview/sessions/${sessionId}/generate-response`, {
+    request<GenerateResponseResult>(`/interview/sessions/${sessionId}/generate-response`, {
       method: 'POST',
       headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(payload ?? {}),

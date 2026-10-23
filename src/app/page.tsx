@@ -191,7 +191,11 @@ export default function Home() {
     },
     onSuccess: (data) => {
       pendingGenerateOperationRef.current = null;
-      pushResponse(data);
+      if (data.status !== 'ANSWER_READY') {
+        setSessionStatus('listening');
+        return;
+      }
+      pushResponse(data.answer);
       setTranscriptInput('');
       setAudioFile(null);
       if (audioInputRef.current) {
