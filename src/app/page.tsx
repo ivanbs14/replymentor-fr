@@ -21,11 +21,19 @@ import {
 
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
-type GenerateOperation = {
+type AutomaticGenerateOperation = {
+  epoch: number;
   sessionId: string;
   transcriptPayload: AddTranscriptPayload;
   transcriptKey: string;
   generationPayload: GenerateResponsePayload;
+  generationKey: string;
+};
+
+type ManualGenerateOperation = {
+  epoch: number;
+  sessionId: string;
+  payload: GenerateResponsePayload & { forceQuestion: string };
   generationKey: string;
 };
 
@@ -61,7 +69,7 @@ export default function Home() {
     sessionId,
     sessionStatus,
     transcriptInput,
-    latestResponse,
+    currentCycle,
     history,
     summary,
     setAuthUser,
@@ -70,7 +78,10 @@ export default function Home() {
     setSessionId,
     setSessionStatus,
     setTranscriptInput,
-    pushResponse,
+    setCycleProcessing,
+    setNeedsConfirmation,
+    pushAnswer,
+    clearCurrentCycle,
     selectResponse,
     setSummary,
   } = useInterviewStore();
@@ -79,7 +90,9 @@ export default function Home() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingResolverRef = useRef<((file: File | null) => void) | null>(null);
-  const pendingGenerateOperationRef = useRef<GenerateOperation | null>(null);
+  const pendingAutomaticOperationRef = useRef<AutomaticGenerateOperation | null>(null);
+  const pendingManualOperationRef = useRef<ManualGenerateOperation | null>(null);
+  const operationEpochRef = useRef(0);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
@@ -88,12 +101,24 @@ export default function Home() {
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [questionInput, setQuestionInput] = useState('');
+
+  const clearPendingOperations = () => {
+    operationEpochRef.current += 1;
+    pendingAutomaticOperationRef.current = null;
+    pendingManualOperationRef.current = null;
+  };
+
+  const isCurrentOperation = (operation: { epoch: number; sessionId: string }) =>
+    operation.epoch === operationEpochRef.current &&
+    useInterviewStore.getState().sessionId === operation.sessionId;
 
   useEffect(() => {
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       setAuthUser(null);
+      clearPendingOperations();
       resetInterviewState();
     };
 
@@ -136,6 +161,7 @@ export default function Home() {
       }),
     onSuccess: (data) => {
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      clearPendingOperations();
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -150,6 +176,7 @@ export default function Home() {
       }),
     onSuccess: (data) => {
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
+      clearPendingOperations();
       setAuthUser(data.user);
       setAuthPassword('');
       resetInterviewState();
@@ -157,27 +184,65 @@ export default function Home() {
   });
 
   const startSessionMutation = useMutation({
-    mutationFn: async () => {
-      if (!contextId) throw new Error('Salve o contexto antes de iniciar a sessão.');
-      return api.startSession(contextId);
+    mutationFn: async (operation: { contextId: string; epoch: number }) => {
+      return api.startSession(operation.contextId);
     },
-    onSuccess: (data) => {
-      pendingGenerateOperationRef.current = null;
+    onSuccess: (data, operation) => {
+      if (operation.epoch !== operationEpochRef.current || !useInterviewStore.getState().authUser) {
+        return;
+      }
+      clearPendingOperations();
+      clearCurrentCycle();
       setSessionId(data.id);
       setSessionStatus('listening');
       void handleStartRecording();
     },
   });
 
-  const generateResponseMutation = useMutation({
+  const handleClosedSession = () => {
+    clearPendingOperations();
+    clearCurrentCycle();
+    if (isRecording) void stopRecordingAndWait();
+    setSessionId(null);
+    setSessionStatus('closed');
+  };
+
+  const handleGenerationSuccess = (
+    data: Awaited<ReturnType<typeof api.generateResponse>>,
+    operation: AutomaticGenerateOperation | ManualGenerateOperation,
+    operationType: 'automatic' | 'manual',
+  ) => {
+    if (!isCurrentOperation(operation)) return;
+    if (operationType === 'automatic') pendingAutomaticOperationRef.current = null;
+    else pendingManualOperationRef.current = null;
+
+    if (data.status === 'NEEDS_CONFIRMATION') {
+      setNeedsConfirmation(data.detection);
+      setQuestionInput(data.detection.question ?? '');
+      setSessionStatus('ready');
+      if (isRecording) void stopRecordingAndWait();
+      return;
+    }
+
+    pushAnswer(data.detection, data.answer);
+    setQuestionInput('');
+    setTranscriptInput('');
+    setAudioFile(null);
+    if (audioInputRef.current) audioInputRef.current.value = '';
+    setSessionStatus('listening');
+    void handleStartRecording();
+  };
+
+  const automaticGenerateMutation = useMutation({
     mutationFn: async ({
       sessionId: operationSessionId,
       transcriptPayload,
       transcriptKey,
       generationPayload,
       generationKey,
-    }: GenerateOperation) => {
+    }: AutomaticGenerateOperation) => {
       setSessionStatus('processing');
+      setCycleProcessing();
       await api.addTranscript(
         operationSessionId,
         transcriptPayload,
@@ -189,41 +254,44 @@ export default function Home() {
         generationKey,
       );
     },
-    onSuccess: (data) => {
-      pendingGenerateOperationRef.current = null;
-      if (data.status !== 'ANSWER_READY') {
-        setSessionStatus('listening');
-        return;
-      }
-      pushResponse(data.answer);
-      setTranscriptInput('');
-      setAudioFile(null);
-      if (audioInputRef.current) {
-        audioInputRef.current.value = '';
-      }
-      setSessionStatus('listening');
-      // Keep continuous capture cycles until the user explicitly ends the session.
-      void handleStartRecording();
-    },
-    onError: (error) => {
+    onSuccess: (data, operation) => handleGenerationSuccess(data, operation, 'automatic'),
+    onError: (error, operation) => {
+      if (!isCurrentOperation(operation)) return;
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
-        pendingGenerateOperationRef.current = null;
-        if (isRecording) void stopRecordingAndWait();
-        setSessionId(null);
-        setSessionStatus('closed');
+        handleClosedSession();
         return;
       }
       setSessionStatus('listening');
+      const latestHistoryItem = useInterviewStore.getState().history[0];
+      if (latestHistoryItem) selectResponse(latestHistoryItem.answer.id);
+      else clearCurrentCycle();
+    },
+  });
+
+  const manualGenerateMutation = useMutation({
+    mutationFn: ({ sessionId: operationSessionId, payload, generationKey }: ManualGenerateOperation) => {
+      setSessionStatus('processing');
+      return api.generateResponse(operationSessionId, payload, generationKey);
+    },
+    onSuccess: (data, operation) => handleGenerationSuccess(data, operation, 'manual'),
+    onError: (error, operation) => {
+      if (!isCurrentOperation(operation)) return;
+      if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
+        handleClosedSession();
+        return;
+      }
+      setSessionStatus('ready');
     },
   });
 
   const endSessionMutation = useMutation({
-    mutationFn: async () => {
-      if (!sessionId) throw new Error('Sessão ainda não iniciada.');
-      return api.endSession(sessionId);
+    mutationFn: async (operation: { sessionId: string; epoch: number }) => {
+      return api.endSession(operation.sessionId);
     },
-    onSuccess: (data) => {
-      pendingGenerateOperationRef.current = null;
+    onSuccess: (data, operation) => {
+      if (!isCurrentOperation(operation)) return;
+      clearPendingOperations();
+      clearCurrentCycle();
       if (isRecording) {
         void stopRecordingAndWait();
       }
@@ -237,7 +305,8 @@ export default function Home() {
     loginMutation.error ||
     registerMutation.error ||
     startSessionMutation.error ||
-    generateResponseMutation.error ||
+    automaticGenerateMutation.error ||
+    manualGenerateMutation.error ||
     endSessionMutation.error;
   const mutationErrorMessage =
     mutationError instanceof Error ? mutationError.message : 'Erro inesperado na requisição.';
@@ -254,7 +323,8 @@ export default function Home() {
     loginMutation.isPending ||
     registerMutation.isPending ||
     startSessionMutation.isPending ||
-    generateResponseMutation.isPending ||
+    automaticGenerateMutation.isPending ||
+    manualGenerateMutation.isPending ||
     endSessionMutation.isPending;
 
   const handleAuthSubmit = (event: FormEvent) => {
@@ -272,6 +342,7 @@ export default function Home() {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       setAuthUser(null);
+      clearPendingOperations();
       resetInterviewState();
     } catch {
       window.alert(
@@ -281,7 +352,7 @@ export default function Home() {
   };
 
   const handleAudioSelection = (event: ChangeEvent<HTMLInputElement>) => {
-    pendingGenerateOperationRef.current = null;
+    pendingAutomaticOperationRef.current = null;
     const selectedFile = event.target.files?.[0] ?? null;
     if (selectedFile) {
       const error = validateAudioFile(selectedFile);
@@ -298,7 +369,7 @@ export default function Home() {
 
   const handleStartRecording = async () => {
     if (isRecording) return;
-    pendingGenerateOperationRef.current = null;
+    pendingAutomaticOperationRef.current = null;
     if (!navigator.mediaDevices?.getUserMedia) {
       setRecordingError('Seu navegador não suporta captura de áudio por microfone.');
       return;
@@ -358,7 +429,7 @@ export default function Home() {
           return;
         }
 
-        pendingGenerateOperationRef.current = null;
+        pendingAutomaticOperationRef.current = null;
         setAudioFile(capturedFile);
         setIsRecording(false);
 
@@ -409,8 +480,8 @@ export default function Home() {
   };
 
   const handleGenerateResponse = async () => {
-    if (pendingGenerateOperationRef.current) {
-      generateResponseMutation.mutate(pendingGenerateOperationRef.current);
+    if (pendingAutomaticOperationRef.current) {
+      automaticGenerateMutation.mutate(pendingAutomaticOperationRef.current);
       return;
     }
     if (!sessionId) {
@@ -446,7 +517,8 @@ export default function Home() {
       };
     }
 
-    const operation: GenerateOperation = {
+    const operation: AutomaticGenerateOperation = {
+      epoch: operationEpochRef.current,
       sessionId,
       transcriptPayload,
       transcriptKey: crypto.randomUUID(),
@@ -456,8 +528,31 @@ export default function Home() {
       },
       generationKey: crypto.randomUUID(),
     };
-    pendingGenerateOperationRef.current = operation;
-    generateResponseMutation.mutate(operation);
+    pendingAutomaticOperationRef.current = operation;
+    automaticGenerateMutation.mutate(operation);
+  };
+
+  const handleManualGenerate = (event: FormEvent) => {
+    event.preventDefault();
+    if (!sessionId) return;
+    if (pendingManualOperationRef.current) {
+      manualGenerateMutation.mutate(pendingManualOperationRef.current);
+      return;
+    }
+    const forceQuestion = questionInput.trim();
+    if (!forceQuestion) return;
+    const operation: ManualGenerateOperation = {
+      epoch: operationEpochRef.current,
+      sessionId,
+      payload: {
+        forceQuestion,
+        provider: selectedProvider,
+        model: selectedModel.trim() || undefined,
+      },
+      generationKey: crypto.randomUUID(),
+    };
+    pendingManualOperationRef.current = operation;
+    manualGenerateMutation.mutate(operation);
   };
 
   const handleStopRecording = () => {
@@ -479,6 +574,7 @@ export default function Home() {
     ollama: 'Ollama',
     openai: 'OpenAI',
   };
+  const currentAnswer = currentCycle.status === 'answer-ready' ? currentCycle.answer : null;
 
   if (!authUser) {
     return (
@@ -699,7 +795,10 @@ export default function Home() {
               <div className="mt-4 flex flex-col gap-3">
                 <button
                   type="button"
-                  onClick={() => startSessionMutation.mutate()}
+                  onClick={() => {
+                    if (!contextId) return;
+                    startSessionMutation.mutate({ contextId, epoch: operationEpochRef.current });
+                  }}
                   disabled={Boolean(sessionId) || startSessionMutation.isPending}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#004ac6] font-semibold text-white hover:opacity-90 disabled:opacity-50"
                 >
@@ -726,7 +825,10 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => endSessionMutation.mutate()}
+                  onClick={() => {
+                    if (!sessionId) return;
+                    endSessionMutation.mutate({ sessionId, epoch: operationEpochRef.current });
+                  }}
                   disabled={!sessionId || sessionStatus === 'closed' || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#ba1a1a] bg-white font-semibold text-[#ba1a1a] hover:bg-[#ffdad6]/40 disabled:opacity-50"
                 >
@@ -747,7 +849,7 @@ export default function Home() {
                 <select
                   value={selectedProvider}
                   onChange={(event) => {
-                    pendingGenerateOperationRef.current = null;
+                    pendingManualOperationRef.current = null;
                     setSelectedProvider(event.target.value as LlmProvider);
                   }}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -762,7 +864,7 @@ export default function Home() {
                 <input
                   value={selectedModel}
                   onChange={(event) => {
-                    pendingGenerateOperationRef.current = null;
+                    pendingManualOperationRef.current = null;
                     setSelectedModel(event.target.value);
                   }}
                   placeholder={`Padrão do backend para ${providerLabelMap[selectedProvider]}`}
@@ -784,11 +886,43 @@ export default function Home() {
                 </span>
               </div>
 
+              {currentCycle.status === 'needs-confirmation' || manualGenerateMutation.isPending ? (
+                <form className="space-y-4 p-6" onSubmit={handleManualGenerate}>
+                  <p className="text-sm text-[#434655]">
+                    {currentCycle.status === 'needs-confirmation' &&
+                    currentCycle.detection.status === 'NOT_FOUND'
+                      ? 'Não identificamos uma pergunta clara no trecho mais recente. Informe a pergunta do entrevistador para continuar.'
+                      : 'Não conseguimos confirmar a pergunta com segurança. Revise a pergunta abaixo antes de gerar a resposta.'}
+                  </p>
+                  <label className="block text-sm font-medium" htmlFor="question-correction">
+                    Pergunta do entrevistador
+                  </label>
+                  <textarea
+                    id="question-correction"
+                    minLength={1}
+                    maxLength={500}
+                    required
+                    value={questionInput}
+                    onChange={(event) => {
+                      pendingManualOperationRef.current = null;
+                      setQuestionInput(event.target.value);
+                    }}
+                    className="w-full rounded-xl border border-[#c3c6d7] p-3"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!sessionId || manualGenerateMutation.isPending || !questionInput.trim()}
+                    className="rounded-xl bg-[#004ac6] px-4 py-2 font-semibold text-white disabled:opacity-50"
+                  >
+                    {manualGenerateMutation.isPending ? 'Gerando resposta…' : 'Gerar resposta corrigida'}
+                  </button>
+                </form>
+              ) : (
               <div className="space-y-6 p-6">
                 <div className="rounded-xl border-l-4 border-[#004ac6] bg-[#eff4ff] p-4">
                   <span className="block text-sm font-medium text-[#004ac6]">Pergunta identificada</span>
                   <p className="mt-1 text-[20px] font-semibold leading-snug">
-                    {latestResponse?.detectedQuestion ??
+                    {currentAnswer?.detectedQuestion ??
                       'Aguardando pergunta para gerar sugestão...'}
                   </p>
                 </div>
@@ -799,7 +933,7 @@ export default function Home() {
                     Resposta sugerida
                   </span>
                   <p className="mt-2 whitespace-pre-wrap text-[16px] leading-7 text-[#0d1c2e]">
-                    {latestResponse?.suggestedAnswer ??
+                    {currentAnswer?.suggestedAnswer ??
                       'Quando você gerar a primeira resposta, ela aparecerá aqui em formato pronto para uso.'}
                   </p>
                 </div>
@@ -808,16 +942,16 @@ export default function Home() {
                   <div className="rounded-xl border border-[#c3c6d7]/40 bg-[#e6eeff] p-4">
                     <span className="block text-sm font-bold text-[#434655]">Versão curta</span>
                     <p className="mt-1 text-sm italic text-[#0d1c2e]">
-                      {latestResponse?.shortVersion ?? '—'}
+                      {currentAnswer?.shortVersion ?? '—'}
                     </p>
                   </div>
                   <div className="rounded-xl border border-[#c3c6d7]/40 bg-[#eff4ff] p-4">
                     <span className="block text-sm font-bold text-[#434655]">Pontos-chave</span>
                     <div className="mt-2 flex flex-wrap gap-2">
-                      {(latestResponse?.keyPoints ?? []).length === 0 ? (
+                      {(currentAnswer?.keyPoints ?? []).length === 0 ? (
                         <span className="text-sm text-[#737686]">—</span>
                       ) : (
-                        latestResponse?.keyPoints.map((point) => (
+                        currentAnswer?.keyPoints.map((point) => (
                           <span
                             key={point}
                             className="rounded border border-[#c3c6d7] bg-white px-2 py-0.5 text-xs font-medium"
@@ -835,7 +969,7 @@ export default function Home() {
                   <div>
                     <span className="block text-sm font-bold">Observação estratégica</span>
                     <p className="text-sm">
-                      {latestResponse?.strategicNote ??
+                      {currentAnswer?.strategicNote ??
                         'Conecte sua resposta com um caso real de projeto para aumentar credibilidade.'}
                     </p>
                   </div>
@@ -847,6 +981,7 @@ export default function Home() {
                   </p>
                 ) : null}
               </div>
+              )}
             </div>
           </section>
 
@@ -860,12 +995,12 @@ export default function Home() {
                   <p className="text-sm text-[#737686]">Nenhuma pergunta registrada ainda.</p>
                 ) : (
                   history.map((item, index) => {
-                    const active = latestResponse?.id === item.id;
+                    const active = currentAnswer?.id === item.answer.id;
                     return (
                       <button
-                        key={item.id}
+                        key={item.answer.id}
                         type="button"
-                        onClick={() => selectResponse(item.id)}
+                        onClick={() => selectResponse(item.answer.id)}
                         className={`w-full rounded-xl p-4 text-left transition ${
                           active
                             ? 'bg-[#2563eb] text-white shadow-md'
@@ -875,7 +1010,7 @@ export default function Home() {
                         <p className="text-xs font-semibold uppercase tracking-wide opacity-80">
                           Pergunta {history.length - index}
                         </p>
-                        <p className="mt-1 text-sm font-medium">{item.detectedQuestion}</p>
+                        <p className="mt-1 text-sm font-medium">{item.detection.question}</p>
                       </button>
                     );
                   })
@@ -892,7 +1027,7 @@ export default function Home() {
                 value={transcriptInput}
                 maxLength={MAX_TRANSCRIPT_CHARS}
                 onChange={(event) => {
-                  pendingGenerateOperationRef.current = null;
+                  pendingAutomaticOperationRef.current = null;
                   setTranscriptInput(event.target.value);
                 }}
                 placeholder="Cole aqui a última fala/pergunta do entrevistador..."

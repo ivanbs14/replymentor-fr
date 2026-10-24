@@ -49,6 +49,23 @@ const answerReadyResponse = {
   },
   answer: response,
 };
+const uncertainDetection = {
+  ...answerReadyResponse.detection,
+  id: 'detection-uncertain',
+  source: 'LLM' as const,
+  confidence: 0.42,
+};
+const notFoundDetection = {
+  ...uncertainDetection,
+  id: 'detection-not-found',
+  status: 'NOT_FOUND' as const,
+  question: null,
+};
+const manualDetection = {
+  ...answerReadyResponse.detection,
+  id: 'detection-manual',
+  source: 'MANUAL' as const,
+};
 const stopTrack = vi.fn();
 const getUserMedia = vi.fn();
 const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
@@ -99,7 +116,9 @@ beforeEach(() => {
   FakeMediaRecorder.isTypeSupported.mockReturnValue(true);
   vi.spyOn(crypto, 'randomUUID')
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
-    .mockReturnValueOnce('00000000-0000-4000-8000-000000000002');
+    .mockReturnValueOnce('00000000-0000-4000-8000-000000000002')
+    .mockReturnValueOnce('00000000-0000-4000-8000-000000000003')
+    .mockReturnValueOnce('00000000-0000-4000-8000-000000000004');
 });
 
 afterEach(() => {
@@ -127,8 +146,8 @@ describe('Home authentication', () => {
         contextId: 'previous-context',
         sessionId: 'previous-session',
         transcriptInput: 'previous private transcript',
-        history: [response],
-        latestResponse: response,
+        history: [{ detection: answerReadyResponse.detection, answer: response }],
+        currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
         summary: 'previous summary',
       });
     });
@@ -145,7 +164,7 @@ describe('Home authentication', () => {
       contextId: null,
       sessionId: null,
       transcriptInput: '',
-      latestResponse: null,
+      currentCycle: { status: 'idle' },
       history: [],
       summary: null,
     });
@@ -175,8 +194,8 @@ describe('Home authentication', () => {
         sessionStatus: 'listening',
         transcriptInput: 'private transcript',
         contextForm: { ...useInterviewStore.getState().contextForm, resumeText: 'private resume' },
-        latestResponse: response,
-        history: [response],
+        currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+        history: [{ detection: answerReadyResponse.detection, answer: response }],
         summary: 'private summary',
       });
     });
@@ -195,7 +214,7 @@ describe('Home authentication', () => {
       sessionStatus: 'idle',
       transcriptInput: '',
       contextForm: { resumeText: '' },
-      latestResponse: null,
+      currentCycle: { status: 'idle' },
       history: [],
       summary: null,
     });
@@ -251,7 +270,14 @@ describe('Home interview session', () => {
     expect(transcript).toHaveValue('');
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(2));
     expect(useInterviewStore.getState()).toMatchObject({
-      sessionId: 'session-test', sessionStatus: 'listening', history: [response],
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: {
+        status: 'answer-ready',
+        detection: answerReadyResponse.detection,
+        answer: response,
+      },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
     });
 
     await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
@@ -294,6 +320,295 @@ describe('Home interview session', () => {
       expect(screen.getByRole('button', { name: /Iniciar escuta/ })).toBeEnabled();
       if (failureAt === 'transcript') expect(api.generateResponse).not.toHaveBeenCalled();
       expect(api.endSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it('pauses on a detected question that needs confirmation and hides the previous answer', async () => {
+    vi.mocked(api.startSession).mockResolvedValue({ id: 'session-test' });
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse).mockResolvedValue({
+      status: 'NEEDS_CONFIRMATION',
+      detection: uncertainDetection,
+      answer: null,
+    });
+    useInterviewStore.setState({
+      currentCycle: {
+        status: 'answer-ready',
+        detection: answerReadyResponse.detection,
+        answer: response,
+      },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: /Iniciar escuta/ }));
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Trecho incerto',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+
+    expect(await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' }))
+      .toHaveValue(response.detectedQuestion);
+    expect(screen.queryByText(response.suggestedAnswer)).not.toBeInTheDocument();
+    expect(useInterviewStore.getState().currentCycle).toEqual({
+      status: 'needs-confirmation',
+      detection: uncertainDetection,
+    });
+    expect(stopTrack).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+  });
+
+  it('shows an empty correction field and the approved instruction when no question was found', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse).mockResolvedValue({
+      status: 'NEEDS_CONFIRMATION',
+      detection: notFoundDetection,
+      answer: null,
+    });
+    useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Trecho sem pergunta',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+
+    expect(await screen.findByText(
+      'Não identificamos uma pergunta clara no trecho mais recente. Informe a pergunta do entrevistador para continuar.',
+    )).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveValue('');
+  });
+
+  it('generates a manual correction without resending the transcript', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse)
+      .mockResolvedValueOnce({
+        status: 'NEEDS_CONFIRMATION',
+        detection: uncertainDetection,
+        answer: null,
+      })
+      .mockResolvedValueOnce({
+        ...answerReadyResponse,
+        detection: manualDetection,
+      });
+    useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Trecho incerto',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+    const question = await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' });
+    await interaction.clear(question);
+    await interaction.type(question, '  Como você lidera incidentes?  ');
+    vi.mocked(api.addTranscript).mockClear();
+    vi.mocked(api.generateResponse).mockClear();
+    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+
+    await waitFor(() => expect(api.generateResponse).toHaveBeenCalledExactlyOnceWith(
+      'session-test',
+      {
+        forceQuestion: 'Como você lidera incidentes?',
+        provider: 'ollama',
+        model: undefined,
+      },
+      '00000000-0000-4000-8000-000000000003',
+    ));
+    expect(api.addTranscript).not.toHaveBeenCalled();
+    expect(await screen.findByText(response.suggestedAnswer)).toBeVisible();
+    expect(useInterviewStore.getState().currentCycle).toEqual({
+      status: 'answer-ready',
+      detection: manualDetection,
+      answer: response,
+    });
+  });
+
+  it('retries a failed manual correction with the same payload and idempotency key', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse)
+      .mockResolvedValueOnce({
+        status: 'NEEDS_CONFIRMATION',
+        detection: uncertainDetection,
+        answer: null,
+      })
+      .mockRejectedValueOnce(new ApiError('Falha temporária.', 503))
+      .mockResolvedValueOnce({ ...answerReadyResponse, detection: manualDetection });
+    useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Trecho incerto',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+    const question = await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' });
+    await interaction.clear(question);
+    await interaction.type(question, 'Como você lidera incidentes?');
+    vi.mocked(api.generateResponse).mockClear();
+
+    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+    expect(await screen.findByText('Falha temporária.')).toBeVisible();
+    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+
+    await waitFor(() => expect(api.generateResponse).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.generateResponse).mock.calls[0]).toEqual(
+      vi.mocked(api.generateResponse).mock.calls[1],
+    );
+    expect(api.addTranscript).toHaveBeenCalledOnce();
+  });
+
+  it.each(['logout', 'unauthorized'] as const)(
+    'ignores a late automatic callback after %s invalidates the operation',
+    async (invalidation) => {
+      vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+      vi.mocked(api.logout).mockResolvedValue({ success: true });
+      let resolveGeneration!: (value: typeof answerReadyResponse) => void;
+      vi.mocked(api.generateResponse).mockImplementation(() => new Promise((resolve) => {
+        resolveGeneration = resolve;
+      }));
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+
+      await interaction.type(
+        screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+        'Trecho pendente',
+      );
+      await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+      await waitFor(() => expect(api.generateResponse).toHaveBeenCalledOnce());
+
+      if (invalidation === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+      } else {
+        const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
+        act(() => handler!());
+      }
+      await screen.findByRole('button', { name: 'Entrar' });
+      act(() => resolveGeneration(answerReadyResponse));
+
+      await waitFor(() => expect(useInterviewStore.getState()).toMatchObject({
+        authUser: null,
+        sessionId: null,
+        sessionStatus: 'idle',
+        currentCycle: { status: 'idle' },
+        history: [],
+      }));
+      expect(getUserMedia).not.toHaveBeenCalled();
+    },
+  );
+
+  it('retries automatic generation with both original payloads and idempotency keys', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse)
+      .mockRejectedValueOnce(new ApiError('Falha temporária.', 503))
+      .mockResolvedValueOnce(answerReadyResponse);
+    useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      '  Trecho original  ',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+    expect(await screen.findByText('Falha temporária.')).toBeVisible();
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'idle' });
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+
+    await screen.findByText(response.suggestedAnswer);
+    expect(api.addTranscript).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.addTranscript).mock.calls[0]).toEqual(
+      vi.mocked(api.addTranscript).mock.calls[1],
+    );
+    expect(api.generateResponse).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.generateResponse).mock.calls[0]).toEqual(
+      vi.mocked(api.generateResponse).mock.calls[1],
+    );
+  });
+
+  it('restores the latest history item after a recoverable automatic failure', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse).mockRejectedValue(new ApiError('Falha temporária.', 503));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: {
+        status: 'answer-ready',
+        detection: answerReadyResponse.detection,
+        answer: response,
+      },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Novo trecho',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+
+    expect(await screen.findByText('Falha temporária.')).toBeVisible();
+    expect(useInterviewStore.getState().currentCycle).toEqual({
+      status: 'answer-ready',
+      detection: answerReadyResponse.detection,
+      answer: response,
+    });
+    expect(screen.getByText(response.suggestedAnswer)).toBeVisible();
+  });
+
+  it.each(['question', 'provider', 'model'] as const)(
+    'invalidates a failed manual operation when the %s changes',
+    async (editedField) => {
+      vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+      vi.mocked(api.generateResponse)
+        .mockResolvedValueOnce({
+          status: 'NEEDS_CONFIRMATION',
+          detection: uncertainDetection,
+          answer: null,
+        })
+        .mockRejectedValueOnce(new ApiError('Falha temporária.', 503))
+        .mockResolvedValueOnce({ ...answerReadyResponse, detection: manualDetection });
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+
+      await interaction.type(
+        screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+        'Trecho incerto',
+      );
+      await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+      const question = await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' });
+      await interaction.clear(question);
+      await interaction.type(question, 'Como você lidera incidentes?');
+      vi.mocked(api.generateResponse).mockClear();
+      await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+      expect(await screen.findByText('Falha temporária.')).toBeVisible();
+
+      if (editedField === 'question') await interaction.type(question, ' Em produção');
+      if (editedField === 'provider') await interaction.selectOptions(screen.getByRole('combobox'), 'gemini');
+      if (editedField === 'model') {
+        await interaction.type(screen.getByPlaceholderText('Padrão do backend para Ollama'), 'modelo-novo');
+      }
+      await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+
+      await waitFor(() => expect(api.generateResponse).toHaveBeenCalledTimes(2));
+      expect(vi.mocked(api.generateResponse).mock.calls[0][2]).toBe(
+        '00000000-0000-4000-8000-000000000003',
+      );
+      expect(vi.mocked(api.generateResponse).mock.calls[1][2]).toBe(
+        '00000000-0000-4000-8000-000000000004',
+      );
+      expect(vi.mocked(api.generateResponse).mock.calls[1][1]).not.toEqual(
+        vi.mocked(api.generateResponse).mock.calls[0][1],
+      );
     },
   );
 });
