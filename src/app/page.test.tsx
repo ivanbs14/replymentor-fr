@@ -72,6 +72,9 @@ const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDe
 
 class FakeMediaRecorder {
   static isTypeSupported = vi.fn(() => true);
+  static deferStop = false;
+  static pendingStop: (() => void) | null = null;
+  static stopCalls = 0;
   state = 'inactive';
   mimeType = 'audio/webm;codecs=opus';
   ondataavailable: ((event: { data: Blob }) => void) | null = null;
@@ -83,9 +86,12 @@ class FakeMediaRecorder {
   }
 
   stop() {
+    FakeMediaRecorder.stopCalls += 1;
     this.state = 'inactive';
     this.ondataavailable?.({ data: new Blob(['simulated audio'], { type: this.mimeType }) });
-    this.onstop?.();
+    const finish = () => this.onstop?.();
+    if (FakeMediaRecorder.deferStop) FakeMediaRecorder.pendingStop = finish;
+    else finish();
   }
 }
 
@@ -114,6 +120,9 @@ beforeEach(() => {
   });
   vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
   FakeMediaRecorder.isTypeSupported.mockReturnValue(true);
+  FakeMediaRecorder.deferStop = false;
+  FakeMediaRecorder.pendingStop = null;
+  FakeMediaRecorder.stopCalls = 0;
   vi.spyOn(crypto, 'randomUUID')
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
     .mockReturnValueOnce('00000000-0000-4000-8000-000000000002')
@@ -224,6 +233,215 @@ describe('Home authentication', () => {
 });
 
 describe('Home interview session', () => {
+  it('presents public detection metadata without leaking absent confidence', async () => {
+    useInterviewStore.setState({
+      currentCycle: {
+        status: 'answer-ready',
+        detection: { ...answerReadyResponse.detection, source: 'DETERMINISTIC', confidence: 0.74 },
+        answer: response,
+      },
+      history: [
+        { detection: { ...answerReadyResponse.detection, source: 'DETERMINISTIC', confidence: 0.74 }, answer: response },
+      ],
+    });
+    await renderAuthenticatedHome();
+
+    expect(screen.getByText('Automática')).toBeVisible();
+    expect(screen.getByText('74%')).toBeVisible();
+    expect(screen.getByText('Confiança baixa')).toBeVisible();
+
+    act(() => {
+      useInterviewStore.setState({
+        currentCycle: { status: 'answer-ready', detection: manualDetection, answer: response },
+      });
+    });
+    expect(screen.getByText('Manual')).toBeVisible();
+    expect(screen.queryByText('0%')).not.toBeInTheDocument();
+
+    act(() => {
+      useInterviewStore.setState({
+        currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      });
+    });
+    expect(screen.getByText('Legada')).toBeVisible();
+  });
+
+  it('announces low confidence, focuses the field, and ignores confirmation by resuming capture', async () => {
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    const question = screen.getByRole('textbox', { name: 'Pergunta do entrevistador' });
+    expect(question).toHaveFocus();
+    expect(screen.getByText('Automática')).toBeVisible();
+    expect(screen.getByText('Confiança baixa')).toBeVisible();
+    expect(screen.getByText('42%')).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent(/revise a pergunta/i);
+
+    await interaction.click(screen.getByRole('button', { name: 'Ignorar por enquanto' }));
+
+    expect(api.generateResponse).not.toHaveBeenCalled();
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'idle' });
+    expect(useInterviewStore.getState().sessionStatus).toBe('listening');
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledOnce());
+  });
+
+  it('opens correction from an answer with the keyboard and focuses the response after success', async () => {
+    vi.mocked(api.generateResponse).mockResolvedValue({
+      ...answerReadyResponse,
+      detection: manualDetection,
+      answer: { ...response, id: 'response-corrected' },
+    });
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    const correction = screen.getByRole('button', { name: 'Corrigir pergunta' });
+    correction.focus();
+    await interaction.keyboard('{Enter}');
+    const question = screen.getByRole('textbox', { name: 'Pergunta do entrevistador' });
+    expect(question).toHaveFocus();
+    expect(question).toHaveValue(response.detectedQuestion);
+
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+    expect(await screen.findByText(response.suggestedAnswer)).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Sugestão de resposta' })).toHaveFocus());
+  });
+
+  it('associates a recoverable manual error with the field and focuses the retry action', async () => {
+    vi.mocked(api.generateResponse).mockRejectedValue(new ApiError('Falha temporária.', 503));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+
+    const error = await screen.findByText('Falha temporária.');
+    const question = screen.getByRole('textbox', { name: 'Pergunta do entrevistador' });
+    expect(question).toHaveAttribute('aria-describedby', expect.stringContaining('question-correction-error'));
+    expect(error).toHaveAttribute('id', 'question-correction-error');
+    expect(screen.getByRole('button', { name: 'Tentar novamente' })).toHaveFocus();
+  });
+
+  it('shows only the current manual error after an earlier automatic failure', async () => {
+    vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
+    vi.mocked(api.generateResponse)
+      .mockRejectedValueOnce(new ApiError('Erro automático antigo.', 503))
+      .mockRejectedValueOnce(new ApiError('Erro manual atual.', 503));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.type(
+      screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+      'Novo trecho',
+    );
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+    expect(await screen.findByText('Erro automático antigo.')).toBeVisible();
+
+    await interaction.click(screen.getByRole('button', { name: 'Corrigir pergunta' }));
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+
+    const fieldError = await screen.findByText('Erro manual atual.');
+    expect(fieldError).toHaveAttribute('id', 'question-correction-error');
+    expect(screen.getByRole('status')).toHaveTextContent('Erro manual atual.');
+    expect(screen.getByRole('status')).not.toHaveTextContent('Erro automático antigo.');
+    expect(screen.queryByText('Erro automático antigo.')).not.toBeInTheDocument();
+  });
+
+  it('waits for an asynchronous recorder stop before exposing correction', async () => {
+    FakeMediaRecorder.deferStop = true;
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+    await screen.findByText('Gravando... clique em Parar gravação.');
+    await interaction.click(screen.getByRole('button', { name: 'Corrigir pergunta' }));
+
+    expect(screen.queryByRole('textbox', { name: 'Pergunta do entrevistador' })).not.toBeInTheDocument();
+    expect(FakeMediaRecorder.pendingStop).toBeTypeOf('function');
+    act(() => FakeMediaRecorder.pendingStop?.());
+
+    expect(await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveFocus();
+    expect(stopTrack).toHaveBeenCalledOnce();
+  });
+
+  it('reuses an in-flight recorder stop across repeated correction attempts', async () => {
+    FakeMediaRecorder.deferStop = true;
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+    await screen.findByText('Gravando... clique em Parar gravação.');
+    const correction = screen.getByRole('button', { name: 'Corrigir pergunta' });
+    act(() => {
+      correction.click();
+      correction.click();
+    });
+
+    expect(FakeMediaRecorder.stopCalls).toBe(1);
+    expect(screen.getByRole('button', { name: 'Pausando captura…' })).toBeDisabled();
+    expect(screen.queryByRole('textbox', { name: 'Pergunta do entrevistador' })).not.toBeInTheDocument();
+
+    act(() => FakeMediaRecorder.pendingStop?.());
+
+    expect(await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveFocus();
+    expect(screen.getAllByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveLength(1);
+  });
+
+  it('invalidates a pending microphone request before opening correction', async () => {
+    let resolveMedia!: (stream: { getTracks: () => { stop: typeof stopTrack }[] }) => void;
+    getUserMedia.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveMedia = resolve;
+    }));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+    await interaction.click(screen.getByRole('button', { name: 'Corrigir pergunta' }));
+    expect(await screen.findByRole('textbox', { name: 'Pergunta do entrevistador' })).toBeVisible();
+
+    act(() => resolveMedia({ getTracks: () => [{ stop: stopTrack }] }));
+    await waitFor(() => expect(stopTrack).toHaveBeenCalledOnce());
+    expect(screen.queryByText('Gravando... clique em Parar gravação.')).not.toBeInTheDocument();
+  });
+
   it('starts capture, generates from the manual transcript and ends with a summary', async () => {
     vi.mocked(api.startSession).mockResolvedValue({ id: 'session-test' });
     vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
@@ -377,9 +595,9 @@ describe('Home interview session', () => {
     );
     await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
 
-    expect(await screen.findByText(
+    expect(await screen.findByRole('status')).toHaveTextContent(
       'Não identificamos uma pergunta clara no trecho mais recente. Informe a pergunta do entrevistador para continuar.',
-    )).toBeVisible();
+    );
     expect(screen.getByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveValue('');
   });
 
@@ -409,7 +627,7 @@ describe('Home interview session', () => {
     await interaction.type(question, '  Como você lidera incidentes?  ');
     vi.mocked(api.addTranscript).mockClear();
     vi.mocked(api.generateResponse).mockClear();
-    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
 
     await waitFor(() => expect(api.generateResponse).toHaveBeenCalledExactlyOnceWith(
       'session-test',
@@ -453,9 +671,9 @@ describe('Home interview session', () => {
     await interaction.type(question, 'Como você lidera incidentes?');
     vi.mocked(api.generateResponse).mockClear();
 
-    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
     expect(await screen.findByText('Falha temporária.')).toBeVisible();
-    await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+    await interaction.click(screen.getByRole('button', { name: 'Tentar novamente' }));
 
     await waitFor(() => expect(api.generateResponse).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.generateResponse).mock.calls[0]).toEqual(
@@ -589,7 +807,7 @@ describe('Home interview session', () => {
       await interaction.clear(question);
       await interaction.type(question, 'Como você lidera incidentes?');
       vi.mocked(api.generateResponse).mockClear();
-      await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+      await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
       expect(await screen.findByText('Falha temporária.')).toBeVisible();
 
       if (editedField === 'question') await interaction.type(question, ' Em produção');
@@ -597,7 +815,7 @@ describe('Home interview session', () => {
       if (editedField === 'model') {
         await interaction.type(screen.getByPlaceholderText('Padrão do backend para Ollama'), 'modelo-novo');
       }
-      await interaction.click(screen.getByRole('button', { name: 'Gerar resposta corrigida' }));
+      await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
 
       await waitFor(() => expect(api.generateResponse).toHaveBeenCalledTimes(2));
       expect(vi.mocked(api.generateResponse).mock.calls[0][2]).toBe(

@@ -8,6 +8,7 @@ import {
   setUnauthorizedHandler,
   type AddTranscriptPayload,
   type GenerateResponsePayload,
+  type QuestionDetection,
 } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useInterviewStore } from '@/lib/interview-store';
@@ -36,6 +37,37 @@ type ManualGenerateOperation = {
   payload: GenerateResponsePayload & { forceQuestion: string };
   generationKey: string;
 };
+
+const detectionSourceLabel = {
+  DETERMINISTIC: 'Automática',
+  LLM: 'Automática',
+  MANUAL: 'Manual',
+  LEGACY: 'Legada',
+} satisfies Record<QuestionDetection['source'], string>;
+
+function DetectionMetadata({ detection }: { detection: QuestionDetection }) {
+  const isAutomatic = detection.source === 'DETERMINISTIC' || detection.source === 'LLM';
+  const isLowConfidence = isAutomatic && detection.confidence !== null && detection.confidence < 0.75;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2" aria-label="Metadados da detecção">
+      <span className="rounded-full bg-[#e6eeff] px-3 py-1 text-xs font-semibold text-[#004ac6]">
+        {detectionSourceLabel[detection.source]}
+      </span>
+      {detection.confidence !== null ? (
+        <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-semibold text-[#434655]">
+          {Math.round(detection.confidence * 100)}%
+        </span>
+      ) : null}
+      {isLowConfidence ? (
+        <span className="flex items-center gap-1 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-900">
+          <span className="material-symbols-outlined text-[16px]" aria-hidden="true">warning</span>
+          Confiança baixa
+        </span>
+      ) : null}
+    </div>
+  );
+}
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
@@ -88,20 +120,46 @@ export default function Home() {
   const audioInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const captureRequestEpochRef = useRef(0);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const recordingResolverRef = useRef<((file: File | null) => void) | null>(null);
+  const recordingResolverRef = useRef<{
+    recorder: MediaRecorder;
+    resolve: (file: File | null) => void;
+  } | null>(null);
+  const recordingStopPromiseRef = useRef<Promise<File | null> | null>(null);
+  const openingCorrectionRef = useRef(false);
   const pendingAutomaticOperationRef = useRef<AutomaticGenerateOperation | null>(null);
   const pendingManualOperationRef = useRef<ManualGenerateOperation | null>(null);
+  const questionInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const responseHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null);
+  const previousCycleStatusRef = useRef(currentCycle.status);
   const operationEpochRef = useRef(0);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [isOpeningCorrection, setIsOpeningCorrection] = useState(false);
   const [recordingError, setRecordingError] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<LlmProvider>('ollama');
   const [selectedModel, setSelectedModel] = useState('');
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
-  const [questionInput, setQuestionInput] = useState('');
+  const [questionInput, setQuestionInput] = useState(
+    currentCycle.status === 'needs-confirmation' ? currentCycle.detection.question ?? '' : '',
+  );
+
+  useEffect(() => {
+    const previousStatus = previousCycleStatusRef.current;
+    previousCycleStatusRef.current = currentCycle.status;
+
+    if (currentCycle.status === 'needs-confirmation') {
+      questionInputRef.current?.focus();
+      return;
+    }
+    if (currentCycle.status === 'answer-ready' && previousStatus === 'needs-confirmation') {
+      responseHeadingRef.current?.focus();
+    }
+  }, [currentCycle]);
 
   const clearPendingOperations = () => {
     operationEpochRef.current += 1;
@@ -207,7 +265,7 @@ export default function Home() {
     setSessionStatus('closed');
   };
 
-  const handleGenerationSuccess = (
+  const handleGenerationSuccess = async (
     data: Awaited<ReturnType<typeof api.generateResponse>>,
     operation: AutomaticGenerateOperation | ManualGenerateOperation,
     operationType: 'automatic' | 'manual',
@@ -217,10 +275,11 @@ export default function Home() {
     else pendingManualOperationRef.current = null;
 
     if (data.status === 'NEEDS_CONFIRMATION') {
+      await stopRecordingAndWait();
+      if (!isCurrentOperation(operation)) return;
       setNeedsConfirmation(data.detection);
       setQuestionInput(data.detection.question ?? '');
       setSessionStatus('ready');
-      if (isRecording) void stopRecordingAndWait();
       return;
     }
 
@@ -254,7 +313,7 @@ export default function Home() {
         generationKey,
       );
     },
-    onSuccess: (data, operation) => handleGenerationSuccess(data, operation, 'automatic'),
+    onSuccess: (data, operation) => void handleGenerationSuccess(data, operation, 'automatic'),
     onError: (error, operation) => {
       if (!isCurrentOperation(operation)) return;
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
@@ -273,7 +332,7 @@ export default function Home() {
       setSessionStatus('processing');
       return api.generateResponse(operationSessionId, payload, generationKey);
     },
-    onSuccess: (data, operation) => handleGenerationSuccess(data, operation, 'manual'),
+    onSuccess: (data, operation) => void handleGenerationSuccess(data, operation, 'manual'),
     onError: (error, operation) => {
       if (!isCurrentOperation(operation)) return;
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
@@ -318,6 +377,12 @@ export default function Home() {
   const displayedErrorMessage = isOllamaTimeoutError
     ? 'Timeout ao chamar Ollama (90000ms).'
     : mutationErrorMessage;
+  const manualMutationErrorMessage =
+    manualGenerateMutation.error instanceof Error
+      ? manualGenerateMutation.error.message
+      : manualGenerateMutation.error
+        ? 'Erro inesperado na requisição.'
+        : null;
 
   const isLoading =
     loginMutation.isPending ||
@@ -368,7 +433,8 @@ export default function Home() {
   };
 
   const handleStartRecording = async () => {
-    if (isRecording) return;
+    if (isRecording || recordingStopPromiseRef.current) return;
+    const captureRequestEpoch = ++captureRequestEpochRef.current;
     pendingAutomaticOperationRef.current = null;
     if (!navigator.mediaDevices?.getUserMedia) {
       setRecordingError('Seu navegador não suporta captura de áudio por microfone.');
@@ -377,6 +443,13 @@ export default function Home() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (
+        captureRequestEpoch !== captureRequestEpochRef.current ||
+        useInterviewStore.getState().currentCycle.status === 'needs-confirmation'
+      ) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       mediaStreamRef.current = stream;
       recordedChunksRef.current = [];
       setRecordingError(null);
@@ -401,12 +474,14 @@ export default function Home() {
         });
         if (blob.size === 0) {
           setRecordingError('Áudio vazio. Grave novamente por alguns segundos.');
-          setIsRecording(false);
-          mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-          mediaStreamRef.current = null;
-          mediaRecorderRef.current = null;
-          if (recordingResolverRef.current) {
-            recordingResolverRef.current(null);
+          stream.getTracks().forEach((track) => track.stop());
+          if (mediaRecorderRef.current === recorder) {
+            setIsRecording(false);
+            mediaStreamRef.current = null;
+            mediaRecorderRef.current = null;
+          }
+          if (recordingResolverRef.current?.recorder === recorder) {
+            recordingResolverRef.current.resolve(null);
             recordingResolverRef.current = null;
           }
           return;
@@ -420,40 +495,48 @@ export default function Home() {
         const audioError = validateAudioFile(capturedFile);
         if (audioError) {
           setRecordingError(audioError);
-          setIsRecording(false);
-          mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-          mediaStreamRef.current = null;
-          mediaRecorderRef.current = null;
-          recordingResolverRef.current?.(null);
-          recordingResolverRef.current = null;
+          stream.getTracks().forEach((track) => track.stop());
+          if (mediaRecorderRef.current === recorder) {
+            setIsRecording(false);
+            mediaStreamRef.current = null;
+            mediaRecorderRef.current = null;
+          }
+          if (recordingResolverRef.current?.recorder === recorder) {
+            recordingResolverRef.current.resolve(null);
+            recordingResolverRef.current = null;
+          }
           return;
         }
 
         pendingAutomaticOperationRef.current = null;
         setAudioFile(capturedFile);
-        setIsRecording(false);
+        if (mediaRecorderRef.current === recorder) setIsRecording(false);
 
         if (audioInputRef.current) {
           audioInputRef.current.value = '';
         }
 
-        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
-        mediaRecorderRef.current = null;
-        if (recordingResolverRef.current) {
-          recordingResolverRef.current(capturedFile);
+        stream.getTracks().forEach((track) => track.stop());
+        if (mediaRecorderRef.current === recorder) {
+          mediaStreamRef.current = null;
+          mediaRecorderRef.current = null;
+        }
+        if (recordingResolverRef.current?.recorder === recorder) {
+          recordingResolverRef.current.resolve(capturedFile);
           recordingResolverRef.current = null;
         }
       };
 
       recorder.onerror = () => {
         setRecordingError('Falha ao gravar áudio. Tente novamente.');
-        setIsRecording(false);
-        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
-        mediaRecorderRef.current = null;
-        if (recordingResolverRef.current) {
-          recordingResolverRef.current(null);
+        stream.getTracks().forEach((track) => track.stop());
+        if (mediaRecorderRef.current === recorder) {
+          setIsRecording(false);
+          mediaStreamRef.current = null;
+          mediaRecorderRef.current = null;
+        }
+        if (recordingResolverRef.current?.recorder === recorder) {
+          recordingResolverRef.current.resolve(null);
           recordingResolverRef.current = null;
         }
       };
@@ -468,15 +551,28 @@ export default function Home() {
   };
 
   const stopRecordingAndWait = async (): Promise<File | null> => {
+    captureRequestEpochRef.current += 1;
+    if (recordingStopPromiseRef.current) return recordingStopPromiseRef.current;
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === 'inactive') {
       return audioFile;
     }
 
-    return new Promise<File | null>((resolve) => {
-      recordingResolverRef.current = resolve;
+    const stopPromise = new Promise<File | null>((resolve) => {
+      recordingResolverRef.current = {
+        recorder,
+        resolve: (file) => resolve(file),
+      };
       recorder.stop();
     });
+    recordingStopPromiseRef.current = stopPromise;
+    try {
+      return await stopPromise;
+    } finally {
+      if (recordingStopPromiseRef.current === stopPromise) {
+        recordingStopPromiseRef.current = null;
+      }
+    }
   };
 
   const handleGenerateResponse = async () => {
@@ -555,6 +651,35 @@ export default function Home() {
     manualGenerateMutation.mutate(operation);
   };
 
+  const handleIgnoreConfirmation = () => {
+    pendingManualOperationRef.current = null;
+    clearCurrentCycle();
+    setQuestionInput('');
+    setSessionStatus('listening');
+    void handleStartRecording();
+  };
+
+  const handleCorrectQuestion = async () => {
+    if (currentCycle.status !== 'answer-ready' || openingCorrectionRef.current) return;
+    openingCorrectionRef.current = true;
+    setIsOpeningCorrection(true);
+    try {
+      await stopRecordingAndWait();
+      if (useInterviewStore.getState().currentCycle.status !== 'answer-ready') return;
+      setQuestionInput(currentCycle.detection.question ?? currentCycle.answer.detectedQuestion);
+      setSessionStatus('ready');
+      setNeedsConfirmation(currentCycle.detection);
+    } finally {
+      openingCorrectionRef.current = false;
+      setIsOpeningCorrection(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!manualGenerateMutation.error) return;
+    retryButtonRef.current?.focus();
+  }, [manualGenerateMutation.error]);
+
   const handleStopRecording = () => {
     void stopRecordingAndWait();
   };
@@ -575,6 +700,23 @@ export default function Home() {
     openai: 'OpenAI',
   };
   const currentAnswer = currentCycle.status === 'answer-ready' ? currentCycle.answer : null;
+  const currentDetection =
+    currentCycle.status === 'answer-ready' || currentCycle.status === 'needs-confirmation'
+      ? currentCycle.detection
+      : null;
+  const confirmationInstruction =
+    currentCycle.status === 'needs-confirmation' && currentCycle.detection.status === 'NOT_FOUND'
+      ? 'Não identificamos uma pergunta clara no trecho mais recente. Informe a pergunta do entrevistador para continuar.'
+      : 'Não conseguimos confirmar a pergunta com segurança. Revise a pergunta abaixo antes de gerar a resposta.';
+  const liveStatus = manualGenerateMutation.isPending
+    ? 'Gerando resposta corrigida.'
+    : manualMutationErrorMessage
+      ? `Erro ao gerar resposta: ${manualMutationErrorMessage}`
+      : currentCycle.status === 'needs-confirmation'
+        ? confirmationInstruction
+        : currentCycle.status === 'answer-ready'
+          ? 'Resposta gerada com sucesso.'
+          : '';
 
   if (!authUser) {
     return (
@@ -789,6 +931,9 @@ export default function Home() {
         </main>
       ) : (
         <main className="mx-auto grid w-full max-w-[1280px] grid-cols-12 gap-6 px-6 py-6">
+          <div role="status" aria-live="polite" className="sr-only">
+            {liveStatus}
+          </div>
           <aside className="col-span-12 space-y-3 md:col-span-3">
             <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
               <h2 className="text-[24px] font-semibold">Sessão em andamento</h2>
@@ -850,6 +995,7 @@ export default function Home() {
                   value={selectedProvider}
                   onChange={(event) => {
                     pendingManualOperationRef.current = null;
+                    manualGenerateMutation.reset();
                     setSelectedProvider(event.target.value as LlmProvider);
                   }}
                   className="h-10 w-full rounded-lg border border-[#c3c6d7] bg-white px-3 text-sm outline-none focus:border-[#004ac6] focus:ring-2 focus:ring-[#004ac6]/30"
@@ -865,6 +1011,7 @@ export default function Home() {
                   value={selectedModel}
                   onChange={(event) => {
                     pendingManualOperationRef.current = null;
+                    manualGenerateMutation.reset();
                     setSelectedModel(event.target.value);
                   }}
                   placeholder={`Padrão do backend para ${providerLabelMap[selectedProvider]}`}
@@ -877,8 +1024,12 @@ export default function Home() {
           <section className="col-span-12 space-y-3 md:col-span-6">
             <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm">
               <div className="flex items-center justify-between border-b border-zinc-100 bg-white p-6">
-                <h2 className="flex items-center gap-2 text-[24px] font-semibold">
-                  <span className="material-symbols-outlined text-[#004ac6]">auto_awesome</span>
+                <h2
+                  ref={responseHeadingRef}
+                  tabIndex={-1}
+                  className="flex items-center gap-2 text-[24px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-[#004ac6] focus-visible:ring-offset-2"
+                >
+                  <span className="material-symbols-outlined text-[#004ac6]" aria-hidden="true">auto_awesome</span>
                   Sugestão de resposta
                 </h2>
                 <span className="rounded-full bg-[#2563eb] px-3 py-1 text-xs font-bold text-white">
@@ -889,36 +1040,75 @@ export default function Home() {
               {currentCycle.status === 'needs-confirmation' || manualGenerateMutation.isPending ? (
                 <form className="space-y-4 p-6" onSubmit={handleManualGenerate}>
                   <p className="text-sm text-[#434655]">
-                    {currentCycle.status === 'needs-confirmation' &&
-                    currentCycle.detection.status === 'NOT_FOUND'
-                      ? 'Não identificamos uma pergunta clara no trecho mais recente. Informe a pergunta do entrevistador para continuar.'
-                      : 'Não conseguimos confirmar a pergunta com segurança. Revise a pergunta abaixo antes de gerar a resposta.'}
+                    {confirmationInstruction}
                   </p>
+                  {currentDetection ? <DetectionMetadata detection={currentDetection} /> : null}
                   <label className="block text-sm font-medium" htmlFor="question-correction">
                     Pergunta do entrevistador
                   </label>
                   <textarea
+                    ref={questionInputRef}
                     id="question-correction"
                     minLength={1}
                     maxLength={500}
                     required
+                    aria-describedby={`question-correction-help${manualMutationErrorMessage ? ' question-correction-error' : ''}`}
                     value={questionInput}
                     onChange={(event) => {
                       pendingManualOperationRef.current = null;
+                      manualGenerateMutation.reset();
                       setQuestionInput(event.target.value);
                     }}
-                    className="w-full rounded-xl border border-[#c3c6d7] p-3"
+                    className="w-full rounded-xl border border-[#c3c6d7] p-3 outline-none focus-visible:border-[#004ac6] focus-visible:ring-2 focus-visible:ring-[#004ac6]/30"
                   />
-                  <button
-                    type="submit"
-                    disabled={!sessionId || manualGenerateMutation.isPending || !questionInput.trim()}
-                    className="rounded-xl bg-[#004ac6] px-4 py-2 font-semibold text-white disabled:opacity-50"
-                  >
-                    {manualGenerateMutation.isPending ? 'Gerando resposta…' : 'Gerar resposta corrigida'}
-                  </button>
+                  <p id="question-correction-help" className="text-xs text-[#737686]">
+                    Revise ou informe a pergunta em até 500 caracteres.
+                  </p>
+                  {manualMutationErrorMessage ? (
+                    <p id="question-correction-error" className="text-sm font-medium text-[#ba1a1a]">
+                      {manualMutationErrorMessage}
+                    </p>
+                  ) : null}
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      ref={retryButtonRef}
+                      type="submit"
+                      disabled={!sessionId || manualGenerateMutation.isPending || !questionInput.trim()}
+                      className="rounded-xl bg-[#004ac6] px-4 py-2 font-semibold text-white outline-none focus-visible:ring-2 focus-visible:ring-[#004ac6] focus-visible:ring-offset-2 disabled:opacity-50"
+                    >
+                      {manualGenerateMutation.isPending
+                        ? 'Gerando resposta…'
+                        : manualGenerateMutation.error
+                          ? 'Tentar novamente'
+                          : 'Confirmar e gerar resposta'}
+                    </button>
+                    {currentCycle.status === 'needs-confirmation' ? (
+                      <button
+                        type="button"
+                        onClick={handleIgnoreConfirmation}
+                        disabled={manualGenerateMutation.isPending}
+                        className="rounded-xl border border-[#c3c6d7] bg-white px-4 py-2 font-semibold text-[#434655] outline-none hover:bg-[#eff4ff] focus-visible:ring-2 focus-visible:ring-[#004ac6] focus-visible:ring-offset-2 disabled:opacity-50"
+                      >
+                        Ignorar por enquanto
+                      </button>
+                    ) : null}
+                  </div>
                 </form>
               ) : (
               <div className="space-y-6 p-6">
+                {currentCycle.status === 'answer-ready' ? (
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <DetectionMetadata detection={currentCycle.detection} />
+                    <button
+                      type="button"
+                      onClick={() => void handleCorrectQuestion()}
+                      disabled={isOpeningCorrection}
+                      className="rounded-xl border border-[#004ac6] bg-white px-4 py-2 text-sm font-semibold text-[#004ac6] outline-none hover:bg-[#eff4ff] focus-visible:ring-2 focus-visible:ring-[#004ac6] focus-visible:ring-offset-2"
+                    >
+                      {isOpeningCorrection ? 'Pausando captura…' : 'Corrigir pergunta'}
+                    </button>
+                  </div>
+                ) : null}
                 <div className="rounded-xl border-l-4 border-[#004ac6] bg-[#eff4ff] p-4">
                   <span className="block text-sm font-medium text-[#004ac6]">Pergunta identificada</span>
                   <p className="mt-1 text-[20px] font-semibold leading-snug">
@@ -1080,7 +1270,7 @@ export default function Home() {
             </div>
           </aside>
 
-          {mutationError ? (
+          {mutationError && !manualGenerateMutation.error ? (
             <div className="col-span-12">
               <Alert variant="destructive">
                 <span className="material-symbols-outlined text-[18px]">error</span>
