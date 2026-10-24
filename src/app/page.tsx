@@ -2,7 +2,7 @@
 
 import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
-import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react';
+import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import {
   api,
   setUnauthorizedHandler,
@@ -127,6 +127,8 @@ export default function Home() {
     resolve: (file: File | null) => void;
   } | null>(null);
   const recordingStopPromiseRef = useRef<Promise<File | null> | null>(null);
+  const canceledRecordersRef = useRef(new WeakSet<MediaRecorder>());
+  const restartCaptureRef = useRef<() => void>(() => undefined);
   const openingCorrectionRef = useRef(false);
   const pendingAutomaticOperationRef = useRef<AutomaticGenerateOperation | null>(null);
   const pendingManualOperationRef = useRef<ManualGenerateOperation | null>(null);
@@ -171,12 +173,41 @@ export default function Home() {
     operation.epoch === operationEpochRef.current &&
     useInterviewStore.getState().sessionId === operation.sessionId;
 
+  const cancelCapture = useCallback((): Promise<File | null> => {
+    captureRequestEpochRef.current += 1;
+    recordedChunksRef.current = [];
+    setAudioFile(null);
+    setRecordingError(null);
+    if (audioInputRef.current) audioInputRef.current.value = '';
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      canceledRecordersRef.current.add(recorder);
+      if (recordingStopPromiseRef.current) return recordingStopPromiseRef.current;
+      if (recorder.state !== 'inactive') {
+        const stopPromise = new Promise<File | null>((resolve) => {
+          recordingResolverRef.current = { recorder, resolve };
+          recorder.stop();
+        });
+        recordingStopPromiseRef.current = stopPromise;
+        void stopPromise.finally(() => {
+          if (recordingStopPromiseRef.current === stopPromise) {
+            recordingStopPromiseRef.current = null;
+          }
+        });
+        return stopPromise;
+      }
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    return Promise.resolve(null);
+  }, []);
+
   useEffect(() => {
     const handleUnauthorized = () => {
       localStorage.removeItem('replymentor_token');
       localStorage.removeItem(SELECTED_CONTEXT_STORAGE_KEY);
       setAuthUser(null);
       clearPendingOperations();
+      cancelCapture();
       resetInterviewState();
     };
 
@@ -196,7 +227,7 @@ export default function Home() {
     return () => {
       setUnauthorizedHandler(null);
     };
-  }, [resetInterviewState, setAuthUser]);
+  }, [cancelCapture, resetInterviewState, setAuthUser]);
 
   useEffect(() => {
     if (!authUser) return;
@@ -260,7 +291,7 @@ export default function Home() {
   const handleClosedSession = () => {
     clearPendingOperations();
     clearCurrentCycle();
-    if (isRecording) void stopRecordingAndWait();
+    cancelCapture();
     setSessionId(null);
     setSessionStatus('closed');
   };
@@ -277,6 +308,7 @@ export default function Home() {
     if (data.status === 'NEEDS_CONFIRMATION') {
       await stopRecordingAndWait();
       if (!isCurrentOperation(operation)) return;
+      manualGenerateMutation.reset();
       setNeedsConfirmation(data.detection);
       setQuestionInput(data.detection.question ?? '');
       setSessionStatus('ready');
@@ -344,19 +376,28 @@ export default function Home() {
   });
 
   const endSessionMutation = useMutation({
-    mutationFn: async (operation: { sessionId: string; epoch: number }) => {
+    mutationFn: async (operation: {
+      sessionId: string;
+      epoch: number;
+      captureFinalization: Promise<File | null>;
+    }) => {
       return api.endSession(operation.sessionId);
     },
     onSuccess: (data, operation) => {
       if (!isCurrentOperation(operation)) return;
       clearPendingOperations();
       clearCurrentCycle();
-      if (isRecording) {
-        void stopRecordingAndWait();
-      }
+      cancelCapture();
       setSummary(data.content);
       setSessionId(null);
       setSessionStatus('closed');
+    },
+    onError: async (_error, operation) => {
+      if (!isCurrentOperation(operation)) return;
+      await operation.captureFinalization;
+      if (!isCurrentOperation(operation)) return;
+      setSessionStatus('listening');
+      restartCaptureRef.current();
     },
   });
 
@@ -402,6 +443,7 @@ export default function Home() {
   };
 
   const handleLogout = async () => {
+    const captureFinalization = cancelCapture();
     try {
       await api.logout();
       localStorage.removeItem('replymentor_token');
@@ -410,6 +452,11 @@ export default function Home() {
       clearPendingOperations();
       resetInterviewState();
     } catch {
+      if (useInterviewStore.getState().authUser && useInterviewStore.getState().sessionId) {
+        await captureFinalization;
+        setSessionStatus('listening');
+        restartCaptureRef.current();
+      }
       window.alert(
         'Não foi possível encerrar a sessão. Tente novamente antes de sair.',
       );
@@ -469,6 +516,20 @@ export default function Home() {
       };
 
       recorder.onstop = () => {
+        if (canceledRecordersRef.current.has(recorder)) {
+          canceledRecordersRef.current.delete(recorder);
+          stream.getTracks().forEach((track) => track.stop());
+          if (mediaRecorderRef.current === recorder) {
+            setIsRecording(false);
+            mediaStreamRef.current = null;
+            mediaRecorderRef.current = null;
+          }
+          if (recordingResolverRef.current?.recorder === recorder) {
+            recordingResolverRef.current.resolve(null);
+            recordingResolverRef.current = null;
+          }
+          return;
+        }
         const blob = new Blob(recordedChunksRef.current, {
           type: recorder.mimeType || 'audio/webm',
         });
@@ -545,10 +606,19 @@ export default function Home() {
       mediaRecorderRef.current = recorder;
       setIsRecording(true);
     } catch {
-      setRecordingError('Permissão de microfone negada ou indisponível.');
-      setIsRecording(false);
+      if (captureRequestEpoch === captureRequestEpochRef.current) {
+        setRecordingError('Permissão de microfone negada ou indisponível.');
+        setIsRecording(false);
+      }
     }
   };
+
+  useEffect(() => {
+    restartCaptureRef.current = () => void handleStartRecording();
+    return () => {
+      restartCaptureRef.current = () => undefined;
+    };
+  });
 
   const stopRecordingAndWait = async (): Promise<File | null> => {
     captureRequestEpochRef.current += 1;
@@ -653,6 +723,7 @@ export default function Home() {
 
   const handleIgnoreConfirmation = () => {
     pendingManualOperationRef.current = null;
+    manualGenerateMutation.reset();
     clearCurrentCycle();
     setQuestionInput('');
     setSessionStatus('listening');
@@ -664,7 +735,10 @@ export default function Home() {
     openingCorrectionRef.current = true;
     setIsOpeningCorrection(true);
     try {
-      await stopRecordingAndWait();
+      const captureFinalization = stopRecordingAndWait();
+      const correctionCaptureEpoch = captureRequestEpochRef.current;
+      await captureFinalization;
+      if (correctionCaptureEpoch !== captureRequestEpochRef.current) return;
       if (useInterviewStore.getState().currentCycle.status !== 'answer-ready') return;
       setQuestionInput(currentCycle.detection.question ?? currentCycle.answer.detectedQuestion);
       setSessionStatus('ready');
@@ -686,6 +760,7 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
+      captureRequestEpochRef.current += 1;
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state !== 'inactive') {
         recorder.stop();
@@ -972,7 +1047,12 @@ export default function Home() {
                   type="button"
                   onClick={() => {
                     if (!sessionId) return;
-                    endSessionMutation.mutate({ sessionId, epoch: operationEpochRef.current });
+                    const captureFinalization = cancelCapture();
+                    endSessionMutation.mutate({
+                      sessionId,
+                      epoch: operationEpochRef.current,
+                      captureFinalization,
+                    });
                   }}
                   disabled={!sessionId || sessionStatus === 'closed' || isLoading}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#ba1a1a] bg-white font-semibold text-[#ba1a1a] hover:bg-[#ffdad6]/40 disabled:opacity-50"

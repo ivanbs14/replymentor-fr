@@ -315,6 +315,18 @@ describe('Home interview session', () => {
     await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
     expect(await screen.findByText(response.suggestedAnswer)).toBeVisible();
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Sugestão de resposta' })).toHaveFocus());
+    expect(useInterviewStore.getState().history).toEqual([
+      { detection: manualDetection, answer: { ...response, id: 'response-corrected' } },
+      { detection: answerReadyResponse.detection, answer: response },
+    ]);
+
+    await interaction.click(screen.getByRole('button', { name: /Pergunta 1/ }));
+    expect(useInterviewStore.getState().currentCycle).toEqual({
+      status: 'answer-ready',
+      detection: answerReadyResponse.detection,
+      answer: response,
+    });
+    expect(screen.getByText('Legada')).toBeVisible();
   });
 
   it('associates a recoverable manual error with the field and focuses the retry action', async () => {
@@ -331,6 +343,7 @@ describe('Home interview session', () => {
 
     const error = await screen.findByText('Falha temporária.');
     const question = screen.getByRole('textbox', { name: 'Pergunta do entrevistador' });
+    expect(question).toHaveValue(response.detectedQuestion);
     expect(question).toHaveAttribute('aria-describedby', expect.stringContaining('question-correction-error'));
     expect(error).toHaveAttribute('id', 'question-correction-error');
     expect(screen.getByRole('button', { name: 'Tentar novamente' })).toHaveFocus();
@@ -442,11 +455,255 @@ describe('Home interview session', () => {
     expect(screen.queryByText('Gravando... clique em Parar gravação.')).not.toBeInTheDocument();
   });
 
+  it.each(['logout', 'unauthorized', 'session-closed', 'end-session'] as const)(
+    'stops a late microphone stream after %s',
+    async (flow) => {
+      let resolveMedia!: (stream: { getTracks: () => { stop: typeof stopTrack }[] }) => void;
+      getUserMedia.mockImplementationOnce(() => new Promise((resolve) => {
+        resolveMedia = resolve;
+      }));
+      vi.mocked(api.logout).mockResolvedValue({ success: true });
+      vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo.' });
+      vi.mocked(api.addTranscript).mockRejectedValue(
+        new ApiError('Sessão encerrada.', 409, 'SESSION_CLOSED'),
+      );
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+      await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+      await waitFor(() => expect(getUserMedia).toHaveBeenCalledOnce());
+
+      if (flow === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+      } else if (flow === 'unauthorized') {
+        const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
+        act(() => handler!());
+      } else if (flow === 'session-closed') {
+        await interaction.type(
+          screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+          'Trecho final',
+        );
+        await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+        await screen.findByText('Sessão encerrada');
+      } else {
+        await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
+        await screen.findByText('Sessão encerrada');
+      }
+
+      act(() => resolveMedia({ getTracks: () => [{ stop: stopTrack }] }));
+      await waitFor(() => expect(stopTrack).toHaveBeenCalledOnce());
+      expect(FakeMediaRecorder.stopCalls).toBe(0);
+      expect(screen.queryByText('Gravando... clique em Parar gravação.')).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(['logout', 'unauthorized', 'session-closed', 'end-session'] as const)(
+    'stops active capture during %s',
+    async (flow) => {
+      vi.mocked(api.logout).mockResolvedValue({ success: true });
+      vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo.' });
+      vi.mocked(api.addTranscript).mockRejectedValue(
+        new ApiError('Sessão encerrada.', 409, 'SESSION_CLOSED'),
+      );
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+      await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+      await screen.findByText('Gravando... clique em Parar gravação.');
+
+      if (flow === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+      } else if (flow === 'unauthorized') {
+        const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
+        act(() => handler!());
+      } else if (flow === 'session-closed') {
+        fireEvent.change(
+          screen.getByPlaceholderText('Cole aqui a última fala/pergunta do entrevistador...'),
+          { target: { value: 'Trecho final' } },
+        );
+        await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+        await screen.findByText('Sessão encerrada');
+      } else {
+        await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
+        await screen.findByText('Sessão encerrada');
+      }
+
+      await waitFor(() => expect(stopTrack).toHaveBeenCalledOnce());
+      expect(FakeMediaRecorder.stopCalls).toBe(1);
+      expect(screen.queryByText('Gravando... clique em Parar gravação.')).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(['logout', 'unauthorized'] as const)(
+    'discards recorded and selected audio across %s and re-authentication',
+    async (flow) => {
+      vi.mocked(api.logout).mockResolvedValue({ success: true });
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      const { container } = await renderAuthenticatedHome();
+      const selectedAudio = new File(['previous audio'], 'audio-antigo.webm', {
+        type: 'audio/webm',
+      });
+      await interaction.upload(container.querySelector('input[type="file"]')!, selectedAudio);
+      expect(screen.getByText(/audio-antigo\.webm/)).toBeVisible();
+      await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+      await screen.findByText('Gravando... clique em Parar gravação.');
+
+      if (flow === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+      } else {
+        const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
+        act(() => handler!());
+      }
+      await screen.findByRole('button', { name: 'Entrar' });
+      localStorage.setItem('replymentor_selected_context_id', 'context-test');
+      act(() => useInterviewStore.setState({
+        authUser: user,
+        contextId: 'context-test',
+        sessionId: 'session-new',
+        sessionStatus: 'listening',
+      }));
+
+      expect(await screen.findByText(user.email)).toBeVisible();
+      expect(screen.queryByText(/audio-antigo\.webm/)).not.toBeInTheDocument();
+      await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+      expect(await screen.findByText(
+        'Adicione um transcript manual ou selecione um áudio para análise.',
+      )).toBeVisible();
+      expect(api.addTranscript).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['logout', 'end-session'] as const)(
+    'resumes capture when provisional %s cancellation fails',
+    async (flow) => {
+      vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+      vi.mocked(api.logout).mockRejectedValue(new ApiError('Falha ao sair.', 503));
+      vi.mocked(api.endSession).mockRejectedValue(new ApiError('Falha ao encerrar.', 503));
+      useInterviewStore.setState({ sessionId: 'session-test', sessionStatus: 'listening' });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+      await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+      await screen.findByText('Gravando... clique em Parar gravação.');
+
+      if (flow === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+        await waitFor(() => expect(window.alert).toHaveBeenCalled());
+      } else {
+        await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
+        expect(await screen.findByText('Falha ao encerrar.')).toBeVisible();
+      }
+
+      await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(2));
+      expect(useInterviewStore.getState()).toMatchObject({
+        sessionId: 'session-test',
+        sessionStatus: 'listening',
+      });
+      expect(await screen.findByText('Gravando... clique em Parar gravação.')).toBeVisible();
+    },
+  );
+
+  it('discards a deferred recorder finalization when logout happens after stop begins', async () => {
+    FakeMediaRecorder.deferStop = true;
+    vi.mocked(api.logout).mockResolvedValue({ success: true });
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'listening',
+      currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+      history: [{ detection: answerReadyResponse.detection, answer: response }],
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+    await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+    await screen.findByText('Gravando... clique em Parar gravação.');
+    await interaction.click(screen.getByRole('button', { name: 'Corrigir pergunta' }));
+    expect(FakeMediaRecorder.pendingStop).toBeTypeOf('function');
+
+    await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+    await screen.findByRole('button', { name: 'Entrar' });
+    localStorage.setItem('replymentor_selected_context_id', 'context-test');
+    act(() => useInterviewStore.setState({
+      authUser: user,
+      contextId: 'context-test',
+      sessionId: 'session-new',
+      sessionStatus: 'listening',
+    }));
+    act(() => FakeMediaRecorder.pendingStop?.());
+
+    expect(await screen.findByText(user.email)).toBeVisible();
+    expect(screen.queryByText(/captura-\d+\.webm/)).not.toBeInTheDocument();
+    await interaction.click(screen.getByRole('button', { name: /Gerar resposta$/ }));
+    expect(await screen.findByText(
+      'Adicione um transcript manual ou selecione um áudio para análise.',
+    )).toBeVisible();
+    expect(api.addTranscript).not.toHaveBeenCalled();
+  });
+
+  it.each(['logout', 'end-session'] as const)(
+    'waits for deferred capture finalization before restarting after failed %s',
+    async (flow) => {
+      FakeMediaRecorder.deferStop = true;
+      vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+      vi.mocked(api.logout).mockRejectedValue(new ApiError('Falha ao sair.', 503));
+      vi.mocked(api.endSession).mockRejectedValue(new ApiError('Falha ao encerrar.', 503));
+      useInterviewStore.setState({
+        sessionId: 'session-test',
+        sessionStatus: 'listening',
+        currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
+        history: [{ detection: answerReadyResponse.detection, answer: response }],
+      });
+      const interaction = userEvent.setup();
+      await renderAuthenticatedHome();
+      await interaction.click(screen.getByRole('button', { name: 'Iniciar gravação' }));
+      await screen.findByText('Gravando... clique em Parar gravação.');
+      await interaction.click(screen.getByRole('button', { name: 'Corrigir pergunta' }));
+      expect(FakeMediaRecorder.pendingStop).toBeTypeOf('function');
+
+      if (flow === 'logout') {
+        await interaction.click(screen.getByRole('button', { name: 'Sair' }));
+      } else {
+        await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
+      }
+      await waitFor(() => expect(flow === 'logout' ? api.logout : api.endSession).toHaveBeenCalledOnce());
+      expect(getUserMedia).toHaveBeenCalledOnce();
+
+      act(() => FakeMediaRecorder.pendingStop?.());
+      await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(2));
+      if (flow === 'end-session') {
+        expect(await screen.findByText('Falha ao encerrar.')).toBeVisible();
+      }
+      expect(useInterviewStore.getState().sessionStatus).toBe('listening');
+    },
+  );
+
+  it('clears a manual error on ignore and still shows a later global error', async () => {
+    vi.mocked(api.generateResponse).mockRejectedValue(new ApiError('Erro manual antigo.', 503));
+    vi.mocked(api.endSession).mockRejectedValue(new ApiError('Falha ao encerrar.', 503));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+    expect(await screen.findByText('Erro manual antigo.')).toBeVisible();
+
+    await interaction.click(screen.getByRole('button', { name: 'Ignorar por enquanto' }));
+    act(() => useInterviewStore.getState().setNeedsConfirmation(notFoundDetection));
+
+    expect(screen.queryByText('Erro manual antigo.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Confirmar e gerar resposta' })).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent(/não identificamos uma pergunta clara/i);
+    await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
+    expect(await screen.findByText('Falha ao encerrar.')).toBeVisible();
+  });
+
   it('starts capture, generates from the manual transcript and ends with a summary', async () => {
     vi.mocked(api.startSession).mockResolvedValue({ id: 'session-test' });
     vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
     vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo simulado da entrevista.' });
-    let resolveGeneration!: (value: typeof answerReadyResponse) => void;
+    let resolveGeneration!: (value: Awaited<ReturnType<typeof api.generateResponse>>) => void;
     vi.mocked(api.generateResponse).mockImplementation(() => new Promise((resolve) => {
       resolveGeneration = resolve;
     }));
@@ -645,6 +902,63 @@ describe('Home interview session', () => {
       detection: manualDetection,
       answer: response,
     });
+    expect(useInterviewStore.getState().history).toEqual([
+      { detection: manualDetection, answer: response },
+    ]);
+  });
+
+  it('closes correction without retry when manual generation returns SESSION_CLOSED', async () => {
+    vi.mocked(api.generateResponse).mockRejectedValue(
+      new ApiError('Sessão encerrada.', 409, 'SESSION_CLOSED'),
+    );
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+
+    expect(await screen.findByText('Sessão encerrada')).toBeVisible();
+    expect(useInterviewStore.getState()).toMatchObject({
+      sessionId: null,
+      sessionStatus: 'closed',
+      currentCycle: { status: 'idle' },
+    });
+    expect(screen.queryByRole('button', { name: 'Tentar novamente' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Pergunta do entrevistador' })).not.toBeInTheDocument();
+  });
+
+  it('ignores a late manual callback after authentication reset clears pending state', async () => {
+    let resolveGeneration!: (value: Awaited<ReturnType<typeof api.generateResponse>>) => void;
+    vi.mocked(api.generateResponse).mockImplementation(() => new Promise((resolve) => {
+      resolveGeneration = resolve;
+    }));
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(screen.getByRole('button', { name: 'Confirmar e gerar resposta' }));
+    await waitFor(() => expect(api.generateResponse).toHaveBeenCalledOnce());
+    const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
+    act(() => handler!());
+    await screen.findByRole('button', { name: 'Entrar' });
+    act(() => resolveGeneration({ ...answerReadyResponse, detection: manualDetection }));
+
+    await waitFor(() => expect(useInterviewStore.getState()).toMatchObject({
+      authUser: null,
+      sessionId: null,
+      sessionStatus: 'idle',
+      currentCycle: { status: 'idle' },
+      history: [],
+    }));
+    expect(getUserMedia).not.toHaveBeenCalled();
   });
 
   it('retries a failed manual correction with the same payload and idempotency key', async () => {
