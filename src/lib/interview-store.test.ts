@@ -1,37 +1,39 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useInterviewStore, type ResponseCard } from './interview-store';
+import type { QuestionDetection, SuggestedAnswerResponse } from './api';
+import { useInterviewStore } from './interview-store';
 
 const initialState = useInterviewStore.getInitialState();
-const response = (id: string): ResponseCard => ({
+const detection = (id: string, source: QuestionDetection['source'] = 'DETERMINISTIC'): QuestionDetection => ({
+  id, status: 'DETECTED', question: `Pergunta ${id}?`, confidence: source === 'MANUAL' ? 1 : 0.92,
+  source, evidence: [], detectorVersion: source === 'MANUAL' ? 'manual' : 'detector-v1',
+  provider: null, model: null, createdAt: '2026-10-22T12:00:00.000Z',
+});
+const answer = (id: string): SuggestedAnswerResponse => ({
   id, detectedQuestion: `Pergunta ${id}?`, suggestedAnswer: `Resposta ${id}`,
   shortVersion: 'Resposta curta', keyPoints: ['Ponto principal'],
   strategicNote: 'Explique o contexto.', createdAt: '2026-10-22T12:00:00.000Z',
 });
 
-beforeEach(() => {
-  useInterviewStore.setState(initialState, true);
-});
+beforeEach(() => useInterviewStore.setState(initialState, true));
 
 describe('interview state', () => {
   it('resets all interview data while preserving the authenticated user', () => {
     const user = { id: 'user-a', email: 'a@example.test' };
     const store = useInterviewStore.getState();
     store.setAuthUser(user);
-    for (const field of Object.keys(initialState.contextForm)) {
-      store.setContextField(field, 'private interview data');
-    }
+    for (const field of Object.keys(initialState.contextForm)) store.setContextField(field, 'private interview data');
     store.setContextId('context-a');
     store.setSessionId('session-a');
     store.setSessionStatus('closed');
     store.setTranscriptInput('Private transcript');
-    store.pushResponse(response('response-a'));
+    store.pushAnswer(detection('detection-a'), answer('answer-a'));
     store.setSummary('Private summary');
     store.resetInterviewState();
 
     expect(useInterviewStore.getState()).toMatchObject({
-      authUser: user, contextForm: initialState.contextForm,
-      contextId: null, sessionId: null, sessionStatus: 'idle', transcriptInput: '',
-      latestResponse: null, history: [], summary: null,
+      authUser: user, contextForm: initialState.contextForm, contextId: null,
+      sessionId: null, sessionStatus: 'idle', transcriptInput: '',
+      currentCycle: { status: 'idle' }, history: [], summary: null,
     });
   });
 
@@ -64,15 +66,19 @@ describe('interview state', () => {
     });
     store.setSessionStatus('processing');
     expect(useInterviewStore.getState().sessionStatus).toBe('processing');
-    const card = response('response-a');
-    store.pushResponse(card);
+    const detected = detection('detection-a');
+    const response = answer('answer-a');
+    store.pushAnswer(detected, response);
     store.setSessionStatus('ready');
-    expect(useInterviewStore.getState()).toMatchObject({ sessionStatus: 'ready', latestResponse: card });
+    expect(useInterviewStore.getState()).toMatchObject({
+      sessionStatus: 'ready', currentCycle: { status: 'answer-ready', detection: detected, answer: response },
+    });
     store.setSummary('Resumo final');
     store.setSessionId(null);
     store.setSessionStatus('closed');
     expect(useInterviewStore.getState()).toMatchObject({
-      sessionId: null, sessionStatus: 'closed', summary: 'Resumo final', history: [card],
+      sessionId: null, sessionStatus: 'closed', summary: 'Resumo final',
+      history: [{ detection: detected, answer: response }],
     });
     store.setContextId(null);
     store.setTranscriptInput('');
@@ -80,28 +86,52 @@ describe('interview state', () => {
   });
 });
 
+describe('current response cycle', () => {
+  it('moves through processing and confirmation before storing a corrected answer', () => {
+    const automaticDetection = detection('automatic');
+    const manualDetection = detection('manual', 'MANUAL');
+    const manualAnswer = answer('manual-answer');
+    const store = useInterviewStore.getState();
+    store.setCycleProcessing();
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'processing' });
+    store.setNeedsConfirmation(automaticDetection);
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'needs-confirmation', detection: automaticDetection });
+    store.pushAnswer(manualDetection, manualAnswer);
+    expect(useInterviewStore.getState().currentCycle).toEqual({
+      status: 'answer-ready', detection: manualDetection, answer: manualAnswer,
+    });
+    expect(useInterviewStore.getState().history).toEqual([{ detection: manualDetection, answer: manualAnswer }]);
+    store.clearCurrentCycle();
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'idle' });
+  });
+});
+
 describe('response history', () => {
   it('keeps the 20 most recent responses in newest-first order', () => {
-    const cards = Array.from({ length: 21 }, (_, index) => response(`response-${index}`));
-    cards.forEach((card) => useInterviewStore.getState().pushResponse(card));
-    expect(useInterviewStore.getState().history).toEqual(cards.slice(1).reverse());
-    expect(useInterviewStore.getState().latestResponse).toEqual(cards[20]);
+    const items = Array.from({ length: 21 }, (_, index) => ({
+      detection: detection(`detection-${index}`), answer: answer(`answer-${index}`),
+    }));
+    items.forEach((item) => useInterviewStore.getState().pushAnswer(item.detection, item.answer));
+    expect(useInterviewStore.getState().history).toEqual(items.slice(1).reverse());
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'answer-ready', ...items[20] });
   });
 
-  it('selects an earlier response without reordering history', () => {
-    const first = response('first');
-    const second = response('second');
+  it('selects an earlier response with its detection without reordering history', () => {
+    const first = { detection: detection('first-detection'), answer: answer('first-answer') };
+    const second = { detection: detection('second-detection'), answer: answer('second-answer') };
     const store = useInterviewStore.getState();
-    store.pushResponse(first);
-    store.pushResponse(second);
-    store.selectResponse(first.id);
-    expect(useInterviewStore.getState()).toMatchObject({ latestResponse: first, history: [second, first] });
+    store.pushAnswer(first.detection, first.answer);
+    store.pushAnswer(second.detection, second.answer);
+    store.selectResponse(first.answer.id);
+    expect(useInterviewStore.getState()).toMatchObject({
+      currentCycle: { status: 'answer-ready', ...first }, history: [second, first],
+    });
     store.selectResponse('missing');
-    expect(useInterviewStore.getState().latestResponse).toEqual(first);
+    expect(useInterviewStore.getState().currentCycle).toEqual({ status: 'answer-ready', ...first });
   });
 
-  it('leaves an empty history unchanged when selecting an unknown response', () => {
+  it('leaves an empty history and idle cycle unchanged when selecting an unknown response', () => {
     useInterviewStore.getState().selectResponse('missing');
-    expect(useInterviewStore.getState()).toMatchObject({ latestResponse: null, history: [] });
+    expect(useInterviewStore.getState()).toMatchObject({ currentCycle: { status: 'idle' }, history: [] });
   });
 });

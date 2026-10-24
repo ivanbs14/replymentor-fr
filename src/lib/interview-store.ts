@@ -1,15 +1,21 @@
 import { create } from 'zustand';
 import { INTERVIEW_TYPES, RESPONSE_PREFERENCES } from './interview-contract';
+import type { QuestionDetection, SuggestedAnswerResponse } from './api';
 
-export type ResponseCard = {
-  id: string;
-  detectedQuestion: string;
-  suggestedAnswer: string;
-  shortVersion: string;
-  keyPoints: string[];
-  strategicNote: string;
-  createdAt: string;
+export type HistoryItem = {
+  detection: QuestionDetection;
+  answer: SuggestedAnswerResponse;
 };
+
+export type CurrentCycle =
+  | { status: 'idle' }
+  | { status: 'processing' }
+  | { status: 'needs-confirmation'; detection: QuestionDetection }
+  | {
+      status: 'answer-ready';
+      detection: QuestionDetection;
+      answer: SuggestedAnswerResponse;
+    };
 
 type InterviewState = {
   authUser: { id: string; email: string } | null;
@@ -27,8 +33,8 @@ type InterviewState = {
   sessionId: string | null;
   sessionStatus: 'idle' | 'listening' | 'processing' | 'ready' | 'closed';
   transcriptInput: string;
-  latestResponse: ResponseCard | null;
-  history: ResponseCard[];
+  currentCycle: CurrentCycle;
+  history: HistoryItem[];
   summary: string | null;
   setAuthUser: (authUser: InterviewState['authUser']) => void;
   resetInterviewState: () => void;
@@ -38,8 +44,11 @@ type InterviewState = {
   setSessionId: (sessionId: string | null) => void;
   setSessionStatus: (status: InterviewState['sessionStatus']) => void;
   setTranscriptInput: (value: string) => void;
-  pushResponse: (response: ResponseCard) => void;
-  selectResponse: (responseId: string) => void;
+  setCycleProcessing: () => void;
+  setNeedsConfirmation: (detection: QuestionDetection) => void;
+  pushAnswer: (detection: QuestionDetection, answer: SuggestedAnswerResponse) => void;
+  clearCurrentCycle: () => void;
+  selectResponse: (answerId: string) => void;
   setSummary: (summary: string) => void;
 };
 
@@ -59,7 +68,7 @@ export const useInterviewStore = create<InterviewState>((set) => ({
   sessionId: null,
   sessionStatus: 'idle',
   transcriptInput: '',
-  latestResponse: null,
+  currentCycle: { status: 'idle' },
   history: [],
   summary: null,
   setAuthUser: (authUser) => set({ authUser }),
@@ -79,7 +88,7 @@ export const useInterviewStore = create<InterviewState>((set) => ({
       sessionId: null,
       sessionStatus: 'idle',
       transcriptInput: '',
-      latestResponse: null,
+      currentCycle: { status: 'idle' },
       history: [],
       summary: null,
     }),
@@ -92,15 +101,21 @@ export const useInterviewStore = create<InterviewState>((set) => ({
   setSessionId: (sessionId) => set({ sessionId }),
   setSessionStatus: (sessionStatus) => set({ sessionStatus }),
   setTranscriptInput: (transcriptInput) => set({ transcriptInput }),
-  pushResponse: (response) =>
+  setCycleProcessing: () => set({ currentCycle: { status: 'processing' } }),
+  setNeedsConfirmation: (detection) =>
+    set({ currentCycle: { status: 'needs-confirmation', detection } }),
+  pushAnswer: (detection, answer) =>
     set((state) => ({
-      latestResponse: response,
-      history: [response, ...state.history].slice(0, 20),
+      currentCycle: { status: 'answer-ready', detection, answer },
+      history: [{ detection, answer }, ...state.history].slice(0, 20),
     })),
-  selectResponse: (responseId) =>
-    set((state) => ({
-      latestResponse:
-        state.history.find((item) => item.id === responseId) ?? state.latestResponse,
-    })),
+  clearCurrentCycle: () => set({ currentCycle: { status: 'idle' } }),
+  selectResponse: (answerId) =>
+    set((state) => {
+      const item = state.history.find(({ answer }) => answer.id === answerId);
+      return item
+        ? { currentCycle: { status: 'answer-ready', ...item } }
+        : { currentCycle: state.currentCycle };
+    }),
   setSummary: (summary) => set({ summary }),
 }));
