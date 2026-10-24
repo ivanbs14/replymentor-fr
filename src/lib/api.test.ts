@@ -57,6 +57,30 @@ describe('API request contract', () => {
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'generation-key' },
       });
     });
+
+  it('sends a forced question with generation options and idempotency metadata', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ id: 'response-a' }));
+
+    await api.generateResponse(
+      'session-a',
+      { forceQuestion: 'Como você lidera incidentes?', provider: 'gemini', model: 'test-model' },
+      'manual-generation-key',
+    );
+
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\/interview\/sessions\/session-a\/generate-response$/),
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          forceQuestion: 'Como você lidera incidentes?',
+          provider: 'gemini',
+          model: 'test-model',
+        }),
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'manual-generation-key' },
+      },
+    );
+  });
 });
 
 describe('API failures and unauthorized handler', () => {

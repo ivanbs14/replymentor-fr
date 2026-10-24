@@ -21,6 +21,7 @@ export type AddTranscriptPayload = {
 };
 
 export type GenerateResponsePayload = {
+  forceQuestion?: string;
   provider?: LlmProvider;
   model?: string;
 };
