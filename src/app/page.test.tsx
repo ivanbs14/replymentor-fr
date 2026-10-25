@@ -18,11 +18,26 @@ vi.mock('@/lib/api', () => ({
     addTranscript: vi.fn(),
     generateResponse: vi.fn(),
     endSession: vi.fn(),
+    getSessionSummary: vi.fn(),
+    retrySessionSummary: vi.fn(),
   },
   setUnauthorizedHandler: vi.fn(),
 }));
 
 const user = { id: 'user-test', email: 'candidate@example.test' };
+const pendingSummary = {
+  id: 'summary-test',
+  sessionId: 'session-test',
+  status: 'PENDING' as const,
+  content: null,
+  fallbackContent: 'Resumo simulado da entrevista.',
+  provider: null,
+  model: null,
+  promptVersion: 'session-summary-v1',
+  startedAt: null,
+  completedAt: null,
+  errorCode: null,
+};
 const response = {
   id: 'response-test',
   detectedQuestion: 'Como você trata concorrência?',
@@ -113,6 +128,7 @@ beforeEach(() => {
     createdAt: '2026-10-22T12:00:00.000Z',
     updatedAt: '2026-10-22T12:00:00.000Z',
   });
+  vi.mocked(api.getSessionSummary).mockResolvedValue(pendingSummary);
   getUserMedia.mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] });
   Object.defineProperty(navigator, 'mediaDevices', {
     configurable: true,
@@ -157,7 +173,7 @@ describe('Home authentication', () => {
         transcriptInput: 'previous private transcript',
         history: [{ detection: answerReadyResponse.detection, answer: response }],
         currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
-        summary: 'previous summary',
+        summary: pendingSummary,
       });
     });
     await interaction.click(screen.getByRole('button', { name: 'Entrar' }));
@@ -205,7 +221,7 @@ describe('Home authentication', () => {
         contextForm: { ...useInterviewStore.getState().contextForm, resumeText: 'private resume' },
         currentCycle: { status: 'answer-ready', detection: answerReadyResponse.detection, answer: response },
         history: [{ detection: answerReadyResponse.detection, answer: response }],
-        summary: 'private summary',
+        summary: pendingSummary,
       });
     });
     const handler = vi.mocked(setUnauthorizedHandler).mock.calls.at(-1)?.[0];
@@ -463,7 +479,7 @@ describe('Home interview session', () => {
         resolveMedia = resolve;
       }));
       vi.mocked(api.logout).mockResolvedValue({ success: true });
-      vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo.' });
+      vi.mocked(api.endSession).mockResolvedValue({ ...pendingSummary, fallbackContent: 'Resumo.' });
       vi.mocked(api.addTranscript).mockRejectedValue(
         new ApiError('Sessão encerrada.', 409, 'SESSION_CLOSED'),
       );
@@ -501,7 +517,7 @@ describe('Home interview session', () => {
     'stops active capture during %s',
     async (flow) => {
       vi.mocked(api.logout).mockResolvedValue({ success: true });
-      vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo.' });
+      vi.mocked(api.endSession).mockResolvedValue({ ...pendingSummary, fallbackContent: 'Resumo.' });
       vi.mocked(api.addTranscript).mockRejectedValue(
         new ApiError('Sessão encerrada.', 409, 'SESSION_CLOSED'),
       );
@@ -702,7 +718,7 @@ describe('Home interview session', () => {
   it('starts capture, generates from the manual transcript and ends with a summary', async () => {
     vi.mocked(api.startSession).mockResolvedValue({ id: 'session-test' });
     vi.mocked(api.addTranscript).mockResolvedValue({ id: 'transcript-test' });
-    vi.mocked(api.endSession).mockResolvedValue({ id: 'summary-test', content: 'Resumo simulado da entrevista.' });
+    vi.mocked(api.endSession).mockResolvedValue(pendingSummary);
     let resolveGeneration!: (value: Awaited<ReturnType<typeof api.generateResponse>>) => void;
     vi.mocked(api.generateResponse).mockImplementation(() => new Promise((resolve) => {
       resolveGeneration = resolve;
@@ -758,10 +774,10 @@ describe('Home interview session', () => {
     await interaction.click(screen.getByRole('button', { name: /Encerrar sessão/ }));
 
     expect(api.endSession).toHaveBeenCalledExactlyOnceWith('session-test');
-    expect(await screen.findByText('Resumo final: Resumo simulado da entrevista.')).toBeVisible();
+    expect(await screen.findByText(/Resumo simulado da entrevista\./)).toBeVisible();
     expect(screen.getByText('Sessão encerrada')).toBeVisible();
     expect(useInterviewStore.getState()).toMatchObject({
-      sessionId: null, sessionStatus: 'closed', summary: 'Resumo simulado da entrevista.',
+      sessionId: null, sessionStatus: 'closed', summary: pendingSummary,
     });
     expect(stopTrack).toHaveBeenCalledTimes(2);
     expect(screen.getByRole('button', { name: /Gerar resposta/ })).toBeDisabled();

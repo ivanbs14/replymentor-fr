@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { INTERVIEW_TYPES, RESPONSE_PREFERENCES } from './interview-contract';
-import type { QuestionDetection, SuggestedAnswerResponse } from './api';
+import type { QuestionDetection, SessionSummaryResponse, SuggestedAnswerResponse } from './api';
 
 export type HistoryItem = {
   detection: QuestionDetection;
@@ -35,7 +35,7 @@ type InterviewState = {
   transcriptInput: string;
   currentCycle: CurrentCycle;
   history: HistoryItem[];
-  summary: string | null;
+  summary: SessionSummaryResponse | null;
   setAuthUser: (authUser: InterviewState['authUser']) => void;
   resetInterviewState: () => void;
   setContextField: (key: string, value: string) => void;
@@ -49,7 +49,7 @@ type InterviewState = {
   pushAnswer: (detection: QuestionDetection, answer: SuggestedAnswerResponse) => void;
   clearCurrentCycle: () => void;
   selectResponse: (answerId: string) => void;
-  setSummary: (summary: string) => void;
+  setSummary: (summary: SessionSummaryResponse) => void;
 };
 
 export const useInterviewStore = create<InterviewState>((set) => ({

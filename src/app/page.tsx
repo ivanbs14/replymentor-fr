@@ -1,6 +1,6 @@
 'use client';
 
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { ChangeEvent, FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -11,6 +11,7 @@ import {
   type QuestionDetection,
 } from '@/lib/api';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { SessionSummary } from '@/components/session-summary';
 import { useInterviewStore } from '@/lib/interview-store';
 import {
   AUDIO_ACCEPT,
@@ -388,7 +389,7 @@ export default function Home() {
       clearPendingOperations();
       clearCurrentCycle();
       cancelCapture();
-      setSummary(data.content);
+      setSummary(data);
       setSessionId(null);
       setSessionStatus('closed');
     },
@@ -399,6 +400,22 @@ export default function Home() {
       setSessionStatus('listening');
       restartCaptureRef.current();
     },
+  });
+
+  const summaryQuery = useQuery({
+    queryKey: ['session-summary', summary?.sessionId],
+    queryFn: () => api.getSessionSummary(summary!.sessionId),
+    enabled: summary?.status === 'PENDING',
+    refetchInterval: (query) => query.state.data?.status === 'PENDING' ? 1_500 : false,
+  });
+
+  useEffect(() => {
+    if (summaryQuery.data) setSummary(summaryQuery.data);
+  }, [setSummary, summaryQuery.data]);
+
+  const retrySummaryMutation = useMutation({
+    mutationFn: (closedSessionId: string) => api.retrySessionSummary(closedSessionId),
+    onSuccess: setSummary,
   });
 
   const mutationError =
@@ -1246,9 +1263,12 @@ export default function Home() {
                 </div>
 
                 {summary ? (
-                  <p className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-                    Resumo final: {summary}
-                  </p>
+                  <SessionSummary
+                    summary={summary}
+                    onRetry={summary.status === 'FAILED' ? () => retrySummaryMutation.mutate(summary.sessionId) : undefined}
+                    isRetrying={retrySummaryMutation.isPending}
+                    showDetailsLink
+                  />
                 ) : null}
               </div>
               )}

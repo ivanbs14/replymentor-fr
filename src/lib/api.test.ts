@@ -1,11 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, setUnauthorizedHandler } from './api';
+import { api, buildRequestHeaders, setUnauthorizedHandler } from './api';
 import { ApiError } from './interview-contract';
 
 const fetchMock = vi.fn<typeof fetch>();
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status, headers: { 'Content-Type': 'application/json' },
 });
+const expectedHeaders = (extra: Record<string, string> = {}) =>
+  expect.objectContaining({
+    'content-type': 'application/json',
+    'x-request-id': expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    ),
+    ...Object.fromEntries(
+      Object.entries(extra).map(([key, value]) => [key.toLowerCase(), value]),
+    ),
+  });
+
+function headersFromCall(call = 0): Record<string, string> {
+  const headers = fetchMock.mock.calls[call]?.[1]?.headers;
+  return Object.fromEntries(new Headers(headers).entries());
+}
 
 beforeEach(() => {
   fetchMock.mockReset();
@@ -24,8 +39,9 @@ describe('API request contract', () => {
     fetchMock.mockResolvedValue(jsonResponse(user));
     await expect(api.me()).resolves.toEqual(user);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/\/auth\/me$/), {
-      credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      credentials: 'include', headers: expect.any(Headers),
     });
+    expect(headersFromCall()).toEqual(expectedHeaders());
   });
 
   it.each(['login', 'register'] as const)('serializes the %s payload with credentials', async (operation) => {
@@ -34,8 +50,9 @@ describe('API request contract', () => {
     await api[operation](credentials);
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(new RegExp(`/auth/${operation}$`)), {
       method: 'POST', body: JSON.stringify(credentials), credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      headers: expect.any(Headers),
     });
+    expect(headersFromCall()).toEqual(expectedHeaders());
   });
 
   it('merges the transcript idempotency header with the JSON header', async () => {
@@ -44,8 +61,9 @@ describe('API request contract', () => {
     await expect(api.addTranscript('session-a', payload, 'transcript-key')).resolves.toEqual({ id: 'chunk-a' });
     expect(fetchMock).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/\/interview\/sessions\/session-a\/transcripts$/), {
       method: 'POST', body: JSON.stringify(payload), credentials: 'include',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'transcript-key' },
+      headers: expect.any(Headers),
     });
+    expect(headersFromCall()).toEqual(expectedHeaders({ 'Idempotency-Key': 'transcript-key' }));
   });
 
   it.each([undefined, { provider: 'gemini' as const, model: 'test-model' }])
@@ -54,8 +72,9 @@ describe('API request contract', () => {
       await api.generateResponse('session-a', payload, 'generation-key');
       expect(fetchMock).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/\/interview\/sessions\/session-a\/generate-response$/), {
         method: 'POST', body: JSON.stringify(payload ?? {}), credentials: 'include',
-        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'generation-key' },
+        headers: expect.any(Headers),
       });
+      expect(headersFromCall()).toEqual(expectedHeaders({ 'Idempotency-Key': 'generation-key' }));
     });
 
   it('sends a forced question with generation options and idempotency metadata', async () => {
@@ -77,9 +96,35 @@ describe('API request contract', () => {
           model: 'test-model',
         }),
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'manual-generation-key' },
+        headers: expect.any(Headers),
       },
     );
+    expect(headersFromCall()).toEqual(expectedHeaders({ 'Idempotency-Key': 'manual-generation-key' }));
+  });
+
+  it('reads and retries the semantic summary through the session contract', async () => {
+    const summary = { id: 'summary-a', sessionId: 'session-a', status: 'PENDING' };
+    fetchMock.mockResolvedValueOnce(jsonResponse(summary)).mockResolvedValueOnce(jsonResponse(summary));
+    await expect(api.getSessionSummary('session-a')).resolves.toEqual(summary);
+    await expect(api.retrySessionSummary('session-a')).resolves.toEqual(summary);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, expect.stringMatching(/\/interview\/sessions\/session-a\/summary$/), {
+      credentials: 'include', headers: expect.any(Headers),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, expect.stringMatching(/\/interview\/sessions\/session-a\/summary\/retry$/), {
+      method: 'POST', body: JSON.stringify({}), credentials: 'include',
+      headers: expect.any(Headers),
+    });
+    expect(headersFromCall(0)).toEqual(expectedHeaders());
+    expect(headersFromCall(1)).toEqual(expectedHeaders());
+  });
+
+  it('creates a fresh request ID and preserves an explicit one', () => {
+    const first = buildRequestHeaders();
+    const second = buildRequestHeaders();
+    expect(first.get('X-Request-ID')).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(second.get('X-Request-ID')).not.toBe(first.get('X-Request-ID'));
+    const explicit = crypto.randomUUID();
+    expect(buildRequestHeaders({ 'X-Request-ID': explicit }).get('X-Request-ID')).toBe(explicit);
   });
 });
 

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { QuestionDetection, SuggestedAnswerResponse } from './api';
+import type { QuestionDetection, SessionSummaryResponse, SuggestedAnswerResponse } from './api';
 import { useInterviewStore } from './interview-store';
 
 const initialState = useInterviewStore.getInitialState();
@@ -13,6 +13,11 @@ const answer = (id: string): SuggestedAnswerResponse => ({
   shortVersion: 'Resposta curta', keyPoints: ['Ponto principal'],
   strategicNote: 'Explique o contexto.', createdAt: '2026-10-22T12:00:00.000Z',
 });
+const summary: SessionSummaryResponse = {
+  id: 'summary-a', sessionId: 'session-a', status: 'PENDING', content: null,
+  fallbackContent: 'Resumo final', provider: null, model: null,
+  promptVersion: 'session-summary-v1', startedAt: null, completedAt: null, errorCode: null,
+};
 
 beforeEach(() => useInterviewStore.setState(initialState, true));
 
@@ -27,7 +32,7 @@ describe('interview state', () => {
     store.setSessionStatus('closed');
     store.setTranscriptInput('Private transcript');
     store.pushAnswer(detection('detection-a'), answer('answer-a'));
-    store.setSummary('Private summary');
+    store.setSummary({ ...summary, fallbackContent: 'Private summary' });
     store.resetInterviewState();
 
     expect(useInterviewStore.getState()).toMatchObject({
@@ -73,11 +78,17 @@ describe('interview state', () => {
     expect(useInterviewStore.getState()).toMatchObject({
       sessionStatus: 'ready', currentCycle: { status: 'answer-ready', detection: detected, answer: response },
     });
-    store.setSummary('Resumo final');
+    store.setSummary(summary);
     store.setSessionId(null);
     store.setSessionStatus('closed');
     expect(useInterviewStore.getState()).toMatchObject({
-      sessionId: null, sessionStatus: 'closed', summary: 'Resumo final',
+      sessionId: null,
+      sessionStatus: 'closed',
+      summary: {
+        id: 'summary-a', sessionId: 'session-a', status: 'PENDING', content: null,
+        fallbackContent: 'Resumo final', provider: null, model: null,
+        promptVersion: 'session-summary-v1', startedAt: null, completedAt: null, errorCode: null,
+      },
       history: [{ detection: detected, answer: response }],
     });
     store.setContextId(null);

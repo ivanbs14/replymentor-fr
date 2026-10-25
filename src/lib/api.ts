@@ -10,6 +10,13 @@ const API_BASE_URL =
 
 let unauthorizedHandler: (() => void) | null = null;
 
+export function buildRequestHeaders(headers?: HeadersInit): Headers {
+  const result = new Headers(headers);
+  if (!result.has('Content-Type')) result.set('Content-Type', 'application/json');
+  if (!result.has('X-Request-ID')) result.set('X-Request-ID', crypto.randomUUID());
+  return result;
+}
+
 export function setUnauthorizedHandler(handler: (() => void) | null) {
   unauthorizedHandler = handler;
 }
@@ -61,14 +68,34 @@ export type GenerateResponseResult =
       answer: null;
     };
 
+export type SessionSummaryContent = {
+  overview: string;
+  questions: Array<{ question: string; answerSummary: string }>;
+  topics: string[];
+  strengths: Array<{ text: string; evidenceResponseId: string }>;
+  improvements: Array<{ text: string; evidenceResponseId: string }>;
+  nextSteps: string[];
+};
+
+export type SessionSummaryResponse = {
+  id: string;
+  sessionId: string;
+  status: 'PENDING' | 'READY' | 'FAILED';
+  content: SessionSummaryContent | null;
+  fallbackContent: string;
+  provider: string | null;
+  model: string | null;
+  promptVersion: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  errorCode: string | null;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
+    headers: buildRequestHeaders(init?.headers),
   });
 
   if (response.status === 401 && unauthorizedHandler) {
@@ -173,7 +200,14 @@ export const api = {
       body: JSON.stringify(payload ?? {}),
     }),
   endSession: (sessionId: string) =>
-    request<{ id: string; content: string }>(`/interview/sessions/${sessionId}/end`, {
+    request<SessionSummaryResponse>(`/interview/sessions/${sessionId}/end`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  getSessionSummary: (sessionId: string) =>
+    request<SessionSummaryResponse>(`/interview/sessions/${sessionId}/summary`),
+  retrySessionSummary: (sessionId: string) =>
+    request<SessionSummaryResponse>(`/interview/sessions/${sessionId}/summary/retry`, {
       method: 'POST',
       body: JSON.stringify({}),
     }),
