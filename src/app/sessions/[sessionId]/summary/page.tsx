@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { SessionSummary } from '@/components/session-summary';
 import { api } from '@/lib/api';
+import { ApiError } from '@/lib/interview-contract';
 
 export default function SessionSummaryPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -13,7 +14,12 @@ export default function SessionSummaryPage() {
     queryKey: ['session-summary', sessionId],
     queryFn: () => api.getSessionSummary(sessionId),
     enabled: Boolean(sessionId),
-    refetchInterval: (query) => query.state.data?.status === 'PENDING' ? 1_500 : false,
+    refetchInterval: (query) => {
+      if (query.state.error instanceof ApiError && query.state.error.statusCode === 429) {
+        return Math.max(query.state.error.retryAfterSeconds ?? 1, 1) * 1_000;
+      }
+      return query.state.data?.status === 'PENDING' ? 1_500 : false;
+    },
   });
   const retryMutation = useMutation({
     mutationFn: () => api.retrySessionSummary(sessionId),

@@ -105,7 +105,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     const raw = await response.text();
     const parsed = parseApiError(raw);
-    throw new ApiError(parsed.message, parsed.statusCode, parsed.code);
+    const retryAfterHeader = Number(response.headers.get('Retry-After'));
+    const retryAfterSeconds =
+      parsed.retryAfterSeconds ??
+      (Number.isSafeInteger(retryAfterHeader) && retryAfterHeader >= 0
+        ? retryAfterHeader
+        : undefined);
+    throw new ApiError(
+      parsed.message,
+      parsed.statusCode,
+      parsed.code,
+      retryAfterSeconds,
+      parsed.requestId,
+    );
   }
 
   return response.json() as Promise<T>;

@@ -39,6 +39,8 @@ export type ParsedApiError = {
   message: string;
   statusCode?: number;
   code?: string;
+  retryAfterSeconds?: number;
+  requestId?: string;
 };
 
 export class ApiError extends Error {
@@ -46,6 +48,8 @@ export class ApiError extends Error {
     message: string,
     readonly statusCode?: number,
     readonly code?: string,
+    readonly retryAfterSeconds?: number,
+    readonly requestId?: string,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -61,6 +65,8 @@ export function parseApiError(raw: string): ParsedApiError {
     const message = Reflect.get(parsed, 'message');
     const statusCode = Reflect.get(parsed, 'statusCode');
     const code = Reflect.get(parsed, 'code');
+    const retryAfterSeconds = Reflect.get(parsed, 'retryAfterSeconds');
+    const requestId = Reflect.get(parsed, 'requestId');
     return {
       message:
         typeof message === 'string' && message.trim().length > 0
@@ -68,6 +74,10 @@ export function parseApiError(raw: string): ParsedApiError {
           : 'Erro de requisição',
       ...(typeof statusCode === 'number' ? { statusCode } : {}),
       ...(typeof code === 'string' ? { code } : {}),
+      ...(Number.isSafeInteger(retryAfterSeconds) && retryAfterSeconds >= 0
+        ? { retryAfterSeconds: retryAfterSeconds as number }
+        : {}),
+      ...(typeof requestId === 'string' ? { requestId } : {}),
     };
   } catch {
     return { message: 'Erro de requisição' };

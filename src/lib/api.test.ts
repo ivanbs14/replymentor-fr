@@ -139,6 +139,24 @@ describe('API failures and unauthorized handler', () => {
     expect(error).not.toHaveProperty('secret');
   });
 
+  it('preserves rate-limit wait metadata with a header fallback', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        message: 'Aguarde.',
+        statusCode: 429,
+        code: 'RATE_LIMIT_EXCEEDED',
+        retryAfterSeconds: 7,
+      }, 429))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        message: 'Aguarde.',
+        statusCode: 429,
+        code: 'RATE_LIMIT_EXCEEDED',
+      }), { status: 429, headers: { 'Retry-After': '9' } }));
+
+    await expect(api.me()).rejects.toMatchObject({ retryAfterSeconds: 7 });
+    await expect(api.me()).rejects.toMatchObject({ retryAfterSeconds: 9 });
+  });
+
   it('uses a safe fallback for non-JSON failures', async () => {
     fetchMock.mockResolvedValue(new Response('private upstream detail', { status: 502 }));
     await expect(api.me()).rejects.toMatchObject({

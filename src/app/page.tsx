@@ -406,7 +406,12 @@ export default function Home() {
     queryKey: ['session-summary', summary?.sessionId],
     queryFn: () => api.getSessionSummary(summary!.sessionId),
     enabled: summary?.status === 'PENDING',
-    refetchInterval: (query) => query.state.data?.status === 'PENDING' ? 1_500 : false,
+    refetchInterval: (query) => {
+      if (query.state.error instanceof ApiError && query.state.error.statusCode === 429) {
+        return Math.max(query.state.error.retryAfterSeconds ?? 1, 1) * 1_000;
+      }
+      return query.state.data?.status === 'PENDING' ? 1_500 : false;
+    },
   });
 
   useEffect(() => {
