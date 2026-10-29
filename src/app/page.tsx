@@ -20,6 +20,10 @@ import {
   type LlmProvider,
   validateAudioFile,
 } from '@/lib/interview-contract';
+import {
+  rateLimitDeadline,
+  rateLimitSecondsRemaining,
+} from '@/lib/rate-limit-wait';
 
 const SELECTED_CONTEXT_STORAGE_KEY = 'replymentor_selected_context_id';
 
@@ -147,6 +151,8 @@ export default function Home() {
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
+  const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null);
+  const [rateLimitClock, setRateLimitClock] = useState(() => Date.now());
   const [questionInput, setQuestionInput] = useState(
     currentCycle.status === 'needs-confirmation' ? currentCycle.detection.question ?? '' : '',
   );
@@ -169,6 +175,29 @@ export default function Home() {
     pendingAutomaticOperationRef.current = null;
     pendingManualOperationRef.current = null;
   };
+
+  const applyRateLimitWait = useCallback((error: unknown) => {
+    const deadline = rateLimitDeadline(error);
+    if (deadline === null) return;
+    setRateLimitClock(Date.now());
+    setRateLimitUntil((current) => Math.max(current ?? 0, deadline));
+  }, []);
+
+  const rateLimitWaitSeconds = rateLimitSecondsRemaining(
+    rateLimitUntil,
+    rateLimitClock,
+  );
+
+  useEffect(() => {
+    if (rateLimitUntil === null) return;
+    const remaining = rateLimitUntil - Date.now();
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(
+      () => setRateLimitClock(Date.now()),
+      Math.min(1_000, remaining),
+    );
+    return () => window.clearTimeout(timer);
+  }, [rateLimitClock, rateLimitUntil]);
 
   const isCurrentOperation = (operation: { epoch: number; sessionId: string }) =>
     operation.epoch === operationEpochRef.current &&
@@ -256,6 +285,7 @@ export default function Home() {
       setAuthPassword('');
       resetInterviewState();
     },
+    onError: applyRateLimitWait,
   });
 
   const registerMutation = useMutation({
@@ -271,6 +301,7 @@ export default function Home() {
       setAuthPassword('');
       resetInterviewState();
     },
+    onError: applyRateLimitWait,
   });
 
   const startSessionMutation = useMutation({
@@ -287,6 +318,7 @@ export default function Home() {
       setSessionStatus('listening');
       void handleStartRecording();
     },
+    onError: applyRateLimitWait,
   });
 
   const handleClosedSession = () => {
@@ -348,6 +380,7 @@ export default function Home() {
     },
     onSuccess: (data, operation) => void handleGenerationSuccess(data, operation, 'automatic'),
     onError: (error, operation) => {
+      applyRateLimitWait(error);
       if (!isCurrentOperation(operation)) return;
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
         handleClosedSession();
@@ -367,6 +400,7 @@ export default function Home() {
     },
     onSuccess: (data, operation) => void handleGenerationSuccess(data, operation, 'manual'),
     onError: (error, operation) => {
+      applyRateLimitWait(error);
       if (!isCurrentOperation(operation)) return;
       if (error instanceof ApiError && error.code === 'SESSION_CLOSED') {
         handleClosedSession();
@@ -393,7 +427,8 @@ export default function Home() {
       setSessionId(null);
       setSessionStatus('closed');
     },
-    onError: async (_error, operation) => {
+    onError: async (error, operation) => {
+      applyRateLimitWait(error);
       if (!isCurrentOperation(operation)) return;
       await operation.captureFinalization;
       if (!isCurrentOperation(operation)) return;
@@ -421,6 +456,7 @@ export default function Home() {
   const retrySummaryMutation = useMutation({
     mutationFn: (closedSessionId: string) => api.retrySessionSummary(closedSessionId),
     onSuccess: setSummary,
+    onError: applyRateLimitWait,
   });
 
   const mutationError =
@@ -439,13 +475,16 @@ export default function Home() {
       normalizedMutationError.includes('timeout'));
   const displayedErrorMessage = isOllamaTimeoutError
     ? 'Timeout ao chamar Ollama (90000ms).'
-    : mutationErrorMessage;
+    : `${mutationErrorMessage}${rateLimitWaitSeconds > 0 ? ` Aguarde ${rateLimitWaitSeconds}s.` : ''}`;
   const manualMutationErrorMessage =
     manualGenerateMutation.error instanceof Error
       ? manualGenerateMutation.error.message
       : manualGenerateMutation.error
         ? 'Erro inesperado na requisição.'
         : null;
+  const displayedManualMutationErrorMessage = manualMutationErrorMessage
+    ? `${manualMutationErrorMessage}${rateLimitWaitSeconds > 0 ? ` Aguarde ${rateLimitWaitSeconds}s.` : ''}`
+    : null;
 
   const isLoading =
     loginMutation.isPending ||
@@ -457,6 +496,7 @@ export default function Home() {
 
   const handleAuthSubmit = (event: FormEvent) => {
     event.preventDefault();
+    if (rateLimitWaitSeconds > 0) return;
     if (authMode === 'login') {
       loginMutation.mutate();
       return;
@@ -852,10 +892,14 @@ export default function Home() {
 
             <button
               type="submit"
-              disabled={isLoading}
+              disabled={isLoading || rateLimitWaitSeconds > 0}
               className="h-11 w-full rounded-xl bg-[#004ac6] text-sm font-semibold text-white hover:opacity-95 disabled:opacity-60"
             >
-              {authMode === 'login' ? 'Entrar' : 'Criar conta'}
+              {rateLimitWaitSeconds > 0
+                ? `Aguarde ${rateLimitWaitSeconds}s`
+                : authMode === 'login'
+                  ? 'Entrar'
+                  : 'Criar conta'}
             </button>
           </form>
 
@@ -1041,7 +1085,7 @@ export default function Home() {
                     if (!contextId) return;
                     startSessionMutation.mutate({ contextId, epoch: operationEpochRef.current });
                   }}
-                  disabled={Boolean(sessionId) || startSessionMutation.isPending}
+                  disabled={Boolean(sessionId) || startSessionMutation.isPending || rateLimitWaitSeconds > 0}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#004ac6] font-semibold text-white hover:opacity-90 disabled:opacity-50"
                 >
                   <span className="material-symbols-outlined text-[20px]">play_circle</span>
@@ -1050,7 +1094,7 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => void handleGenerateResponse()}
-                  disabled={!sessionId || isLoading}
+                  disabled={!sessionId || isLoading || rateLimitWaitSeconds > 0}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-[#4b41e1] font-semibold text-white shadow-lg shadow-[#4b41e1]/20 hover:opacity-90 disabled:opacity-50"
                 >
                   <span className="material-symbols-outlined text-[20px]">psychology</span>
@@ -1059,7 +1103,7 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => void handleGenerateResponse()}
-                  disabled={!sessionId || isLoading}
+                  disabled={!sessionId || isLoading || rateLimitWaitSeconds > 0}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#004ac6]/20 bg-white font-semibold text-[#004ac6] hover:bg-[#eff4ff] disabled:opacity-50"
                 >
                   <span className="material-symbols-outlined text-[20px]">refresh</span>
@@ -1076,7 +1120,7 @@ export default function Home() {
                       captureFinalization,
                     });
                   }}
-                  disabled={!sessionId || sessionStatus === 'closed' || isLoading}
+                  disabled={!sessionId || sessionStatus === 'closed' || isLoading || rateLimitWaitSeconds > 0}
                   className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#ba1a1a] bg-white font-semibold text-[#ba1a1a] hover:bg-[#ffdad6]/40 disabled:opacity-50"
                 >
                   <span className="material-symbols-outlined text-[20px]">stop_circle</span>
@@ -1154,7 +1198,7 @@ export default function Home() {
                     minLength={1}
                     maxLength={500}
                     required
-                    aria-describedby={`question-correction-help${manualMutationErrorMessage ? ' question-correction-error' : ''}`}
+                    aria-describedby={`question-correction-help${displayedManualMutationErrorMessage ? ' question-correction-error' : ''}`}
                     value={questionInput}
                     onChange={(event) => {
                       pendingManualOperationRef.current = null;
@@ -1166,16 +1210,16 @@ export default function Home() {
                   <p id="question-correction-help" className="text-xs text-[#737686]">
                     Revise ou informe a pergunta em até 500 caracteres.
                   </p>
-                  {manualMutationErrorMessage ? (
+                  {displayedManualMutationErrorMessage ? (
                     <p id="question-correction-error" className="text-sm font-medium text-[#ba1a1a]">
-                      {manualMutationErrorMessage}
+                      {displayedManualMutationErrorMessage}
                     </p>
                   ) : null}
                   <div className="flex flex-wrap gap-3">
                     <button
                       ref={retryButtonRef}
                       type="submit"
-                      disabled={!sessionId || manualGenerateMutation.isPending || !questionInput.trim()}
+                      disabled={!sessionId || manualGenerateMutation.isPending || !questionInput.trim() || rateLimitWaitSeconds > 0}
                       className="rounded-xl bg-[#004ac6] px-4 py-2 font-semibold text-white outline-none focus-visible:ring-2 focus-visible:ring-[#004ac6] focus-visible:ring-offset-2 disabled:opacity-50"
                     >
                       {manualGenerateMutation.isPending
@@ -1270,8 +1314,8 @@ export default function Home() {
                 {summary ? (
                   <SessionSummary
                     summary={summary}
-                    onRetry={summary.status === 'FAILED' ? () => retrySummaryMutation.mutate(summary.sessionId) : undefined}
-                    isRetrying={retrySummaryMutation.isPending}
+                    onRetry={summary.status === 'FAILED' && rateLimitWaitSeconds === 0 ? () => retrySummaryMutation.mutate(summary.sessionId) : undefined}
+                    isRetrying={retrySummaryMutation.isPending || rateLimitWaitSeconds > 0}
                     showDetailsLink
                   />
                 ) : null}

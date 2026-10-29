@@ -210,6 +210,26 @@ describe('Home authentication', () => {
     expect(screen.queryByRole('button', { name: 'Sair' })).not.toBeInTheDocument();
   });
 
+  it('disables authentication until the server retry deadline after 429', async () => {
+    vi.mocked(api.me).mockRejectedValue(new ApiError('Não autorizado.', 401));
+    vi.mocked(api.login).mockRejectedValue(
+      new ApiError('Muitas solicitações.', 429, 'RATE_LIMIT_EXCEEDED', 7),
+    );
+    const interaction = userEvent.setup();
+    const { container } = renderWithProviders(<Home />);
+
+    await interaction.type(screen.getByRole('textbox'), user.email);
+    await interaction.type(
+      container.querySelector('input[type="password"]')!,
+      'test-password',
+    );
+    await interaction.click(screen.getByRole('button', { name: 'Entrar' }));
+
+    expect(await screen.findByText(/Muitas solicitações\. Aguarde 7s\./)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Aguarde 7s' })).toBeDisabled();
+    expect(api.login).toHaveBeenCalledOnce();
+  });
+
   it('clears authentication, storage and private interview data through the global 401 handler', async () => {
     const { unmount } = await renderAuthenticatedHome();
     localStorage.setItem('replymentor_token', 'legacy-test-token');
@@ -363,6 +383,31 @@ describe('Home interview session', () => {
     expect(question).toHaveAttribute('aria-describedby', expect.stringContaining('question-correction-error'));
     expect(error).toHaveAttribute('id', 'question-correction-error');
     expect(screen.getByRole('button', { name: 'Tentar novamente' })).toHaveFocus();
+  });
+
+  it('preserves a manual generation and blocks resubmission during Retry-After', async () => {
+    vi.mocked(api.generateResponse).mockRejectedValue(
+      new ApiError('Muitas solicitações.', 429, 'RATE_LIMIT_EXCEEDED', 5),
+    );
+    useInterviewStore.setState({
+      sessionId: 'session-test',
+      sessionStatus: 'ready',
+      currentCycle: { status: 'needs-confirmation', detection: uncertainDetection },
+    });
+    const interaction = userEvent.setup();
+    await renderAuthenticatedHome();
+
+    await interaction.click(
+      screen.getByRole('button', { name: 'Confirmar e gerar resposta' }),
+    );
+
+    expect(await screen.findByText(/Muitas solicitações\. Aguarde 5s\./)).toBeVisible();
+    const retry = screen.getByRole('button', { name: 'Tentar novamente' });
+    expect(retry).toBeDisabled();
+    expect(screen.getByRole('textbox', { name: 'Pergunta do entrevistador' })).toHaveValue(
+      response.detectedQuestion,
+    );
+    expect(api.generateResponse).toHaveBeenCalledOnce();
   });
 
   it('shows only the current manual error after an earlier automatic failure', async () => {
